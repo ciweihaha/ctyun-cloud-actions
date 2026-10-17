@@ -1,0 +1,22 @@
+name: 天翼云电脑每日任务
+
+on:
+  schedule:
+    - cron: '0 0 * * *'   # 北京时间 8:00
+    - cron: '0 12 * * *'  # 北京时间 20:00
+  workflow_dispatch:
+
+jobs:
+  ctyun-tasks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install --production
+      - env:
+          CTYUN_USER: ${{ secrets.CTYUN_USER }}
+          CTYUN_PASS: ${{ secrets.CTYUN_PASS }}
+        run: node cli.js
