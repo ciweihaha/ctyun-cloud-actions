@@ -1,0 +1,15 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 账号/凭证材料：绝不入库
+public_credentials.json
+credentials.json
+data/
+
+# Node
+node_modules/
+
+# 系统
+.DS_Store
