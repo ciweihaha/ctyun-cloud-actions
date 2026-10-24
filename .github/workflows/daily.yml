@@ -2,20 +2,34 @@ name: 天翼云电脑每日任务
 
 on:
   schedule:
-    - cron: '0 0 * * *'   # 北京时间 8:00
-    - cron: '0 12 * * *'  # 北京时间 20:00
+    - cron: '0 0 * * *'   # 08:00 Asia/Shanghai
+    - cron: '0 12 * * *'  # 20:00 Asia/Shanghai
   workflow_dispatch:
+
+# G10: minimal permissions - workflow only needs to read code; secrets come via env
+permissions:
+  contents: read
+
+# G10: prevent overlapping runs against the same account
+concurrency:
+  group: ctyun-daily-tasks
+  cancel-in-progress: false
 
 jobs:
   ctyun-tasks:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      # G10: actions pinned to full commit SHA of the v4 tags
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '20'
-      - run: npm install --production
+      # G10: reproducible install from lockfile (was: npm install --production)
+      - run: npm ci --omit=dev
+      # G10: test gate - unit tests must pass before real tasks run
+      - name: Run unit tests (gate)
+        run: npm test
       - env:
           CTYUN_USER: ${{ secrets.CTYUN_USER }}
           CTYUN_PASS: ${{ secrets.CTYUN_PASS }}

@@ -14,7 +14,26 @@ if (typeof dns.setDefaultResultOrder === 'function') {
 const WebSocket = require('ws');
 const CtYunEncryption = require('./app/ctyun_encryption');
 const { executeNativeAiChat, executeNativeSign, executeNativeHang } = require('./app/tasks/native_tasks');
-const { AuthManager } = require('./app/auth_manager');
+const { AuthManager, validatePasswordPolicy } = require('./app/auth_manager');
+const { LoginRateLimiter } = require('./app/login_rate_limit');
+const { AsyncLocalStorage } = require('async_hooks');
+const {
+  parseJsonBody: parseJsonBodyImpl,
+  readRawBody,
+  corsHeadersFor,
+  parseAllowedOrigins,
+  createExceptionGuard,
+} = require('./app/http_util');
+const {
+  validateProxyTarget,
+  buildProxyHeaders,
+  PROXY_BODY_MAX_BYTES,
+  PROXY_UPSTREAM_TIMEOUT_MS,
+} = require('./app/proxy_util');
+// 【缺陷修复 G5】请求级上下文：供 jsonResponse 等无 req 参数的助手取当前请求的 CORS 判定
+const requestContext = new AsyncLocalStorage();
+// 【缺陷修复 G5】CORS 仅同源或 CTYUN_CORS_ORIGINS 名单（逗号分隔）放行，替代全站 '*'
+const CORS_ALLOWED_ORIGINS = parseAllowedOrigins(process.env.CTYUN_CORS_ORIGINS);
 const { TaskScheduler } = require('./app/tasks/scheduler');
 const { SohoClient } = require('./app/ydpc/soho_client');
 const { performCagAuthHold } = require('./app/ydpc/cag_client');
@@ -30,9 +49,21 @@ const { LogPersister } = require('./app/persist_log');
 //   ① 异常/拒绝除 console.error 外**同时落持久日志**（stderr 可能丢失，jsonl 一定在）；
 //   ② 'exit' 钩子记录退出码（进程自杀/正常退出均可见）；
 //   ③ SIGINT/SIGTERM 记录并优雅退出（被要求停止时也留证）。
+// 【缺陷修复 G5】未捕获异常熔断：旧实现无限吞异常常驻，进程可带病长期运行。
+// 窗口（默认 10 分钟）内累计达阈值（默认 5，env CTYUN_FATAL_EXCEPTION_THRESHOLD 可调）
+// 判定进程不健康：落盘堆栈 → 停调度 → exit(1)，交给守护进程/Docker 重启策略拉起干净进程。
+const exceptionGuard = createExceptionGuard({
+  threshold: Math.max(1, parseInt(process.env.CTYUN_FATAL_EXCEPTION_THRESHOLD || '5', 10) || 5),
+  onFatal: (err, count) => {
+    try { appendLog('System', `❌ 未捕获异常窗口内累计 ${count} 次，判定进程不健康，主动退出待守护重启。最后异常: ${(err && err.stack) || err}`, 'error'); } catch (e) {}
+    try { if (typeof taskScheduler !== 'undefined' && taskScheduler) taskScheduler.stop(); } catch (e) {}
+    process.exit(1);
+  },
+});
 process.on('uncaughtException', (err) => {
   console.error('[!] 系统未捕获异常已拦截 (常驻保障):', err?.message || err);
   try { appendLog('System', `⚠️ 未捕获异常已拦截（进程继续运行）: ${(err && err.message) || err}`, 'error'); } catch (e) { /* 日志不可用则仅 console */ }
+  exceptionGuard.record(err);
 });
 process.on('unhandledRejection', (reason) => {
   console.error('[!] 系统未处理 Promise 拒绝已拦截:', reason?.message || reason);
@@ -483,64 +514,9 @@ function generateDeviceCode() {
   return 'web_' + s;
 }
 
-// SSRF 防护：校验 URL 是否为安全的外部公共 HTTP/HTTPS 地址
-function isPrivateIpOrHost(hostname) {
-  const h = (hostname || '').toLowerCase().trim();
-  if (!h) return true;
-  if (h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '0.0.0.0') return true;
-  if (h.endsWith('.local') || h.endsWith('.internal') || h.endsWith('.lan')) return true;
-
-  if (net.isIPv4(h)) {
-    const parts = h.split('.').map(Number);
-    if (parts[0] === 127) return true; // 127.0.0.0/8 loopback
-    if (parts[0] === 10) return true;  // 10.0.0.0/8 private
-    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true; // 172.16.0.0/12 private
-    if (parts[0] === 192 && parts[1] === 168) return true; // 192.168.0.0/16 private
-    if (parts[0] === 169 && parts[1] === 254) return true; // 169.254.0.0/16 link-local / cloud metadata
-    if (parts[0] === 0) return true;   // 0.0.0.0/8 current network
-  }
-
-  if (net.isIPv6(h)) {
-    if (h === '::1' || h === '::') return true;
-    if (h.startsWith('fe80:')) return true; // link-local
-    if (h.startsWith('fc00:') || h.startsWith('fd00:')) return true; // ULA
-  }
-
-  return false;
-}
-
-function isValidWebhookTarget(channel, rawTarget) {
-  if (!rawTarget || typeof rawTarget !== 'string') return false;
-  const target = rawTarget.trim();
-  if (!target) return false;
-
-  const ch = channel || 'webhook';
-  // Token 型推送渠道 (向平台官方公共 API 发送请求)
-  if (ch === 'serverchan' || ch === 'pushplus') {
-    return /^[\w\-]{6,128}$/.test(target);
-  }
-  if (ch === 'telegram') {
-    // 格式 botToken@chatId
-    return /^[\w\-:]+@[\w\-]+$/.test(target);
-  }
-
-  // 钉钉支持输入纯 access_token (32~128位字符)
-  if (ch === 'dingtalk' && /^[a-zA-Z0-9_\-]{32,128}$/.test(target)) {
-    return true;
-  }
-
-  // URL 型推送渠道 (webhook, qywx, dingtalk, feishu, bark)
-  try {
-    // 剥离可能附带的 @SEC... 密钥后缀以供 URL 校验
-    const checkUrl = target.split('@SEC')[0].trim();
-    const u = new URL(checkUrl);
-    if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
-    if (isPrivateIpOrHost(u.hostname)) return false;
-    return true;
-  } catch (e) {
-    return false;
-  }
-}
+// SSRF 防护与 Webhook 安全发送已下沉 app/webhook_util（缺陷修复 G7）：
+// 在原字面校验基础上补 DNS 解析逐地址校验、重定向逐跳复检、超时与拒内嵌用户信息。
+const { isValidWebhookTarget, safeFetchJson } = require('./app/webhook_util');
 
 function isValidWebhookUrl(rawUrl) {
   return isValidWebhookTarget('webhook', rawUrl);
@@ -589,7 +565,7 @@ async function sendNotification(settings, title, content, extraVars = {}) {
 
   try {
     if (channel === 'webhook' && notify.webhookUrl) {
-      const res = await fetch(notify.webhookUrl, {
+      const res = await safeFetchJson(notify.webhookUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ title: finalTitle, content: finalContent, time: vars['{time}'] })
@@ -603,7 +579,7 @@ async function sendNotification(settings, title, content, extraVars = {}) {
           content: `### ${finalTitle}\n\n${finalContent}\n\n> 触发时间: ${vars['{time}']}`
         }
       };
-      const res = await fetch(notify.webhookUrl, {
+      const res = await safeFetchJson(notify.webhookUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(qywxPayload)
@@ -654,7 +630,7 @@ async function sendNotification(settings, title, content, extraVars = {}) {
           text: `### ${finalTitle}\n\n${finalContent}\n\n> 触发时间: ${vars['{time}']}`
         }
       };
-      const res = await fetch(dingUrl, {
+      const res = await safeFetchJson(dingUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(dingPayload)
@@ -713,7 +689,9 @@ async function sendNotification(settings, title, content, extraVars = {}) {
         feishuPayload.timestamp = timestamp;
         feishuPayload.sign = sign;
       }
-      const res = await fetch(notify.webhookUrl, {
+      // 【缺陷修复 G7】旧实现误用原始 notify.webhookUrl 发送（带 @secret 后缀的非法 URL，
+      // 且密钥随 URL 外泄）；钉钉分支用的是拆分后的 dingUrl，对照坐实此处必须用 feishuUrl。
+      const res = await safeFetchJson(feishuUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(feishuPayload)
@@ -723,14 +701,15 @@ async function sendNotification(settings, title, content, extraVars = {}) {
       return { success: isOk, message: feishuData.msg || feishuData.StatusMessage || `HTTP ${res.status}` };
     } else if (channel === 'serverchan' && notify.webhookUrl) {
       const url = `https://sctapi.ftqq.com/${notify.webhookUrl}.send`;
-      const res = await fetch(url, {
+      const res = await safeFetchJson(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: new URLSearchParams({ title: finalTitle, desp: finalContent }).toString()
       });
       return { success: res.ok, message: `HTTP ${res.status}` };
     } else if (channel === 'pushplus' && notify.webhookUrl) {
-      const res = await fetch('http://www.pushplus.plus/send', {
+      // 【缺陷修复 G7】官方接口支持 HTTPS，旧实现明文 http 发送 token，改走 https
+      const res = await safeFetchJson('https://www.pushplus.plus/send', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ token: notify.webhookUrl, title: finalTitle, content: finalContent })
@@ -738,12 +717,12 @@ async function sendNotification(settings, title, content, extraVars = {}) {
       return { success: res.ok, message: `HTTP ${res.status}` };
     } else if (channel === 'bark' && notify.webhookUrl) {
       const base = notify.webhookUrl.replace(/\/+$/, '');
-      const res = await fetch(`${base}/${encodeURIComponent(finalTitle)}/${encodeURIComponent(finalContent)}`);
+      const res = await safeFetchJson(`${base}/${encodeURIComponent(finalTitle)}/${encodeURIComponent(finalContent)}`, { method: 'GET' });
       return { success: res.ok, message: `HTTP ${res.status}` };
     } else if (channel === 'telegram' && notify.webhookUrl) {
       const [botToken, chatId] = notify.webhookUrl.split('@');
       if (botToken && chatId) {
-        const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+        const res = await safeFetchJson(`https://api.telegram.org/bot${botToken}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ chat_id: chatId, text: `*${finalTitle}*\n\n${finalContent}`, parse_mode: 'Markdown' })
@@ -838,6 +817,12 @@ function getOrCreateMasterKey() {
   }
 
   // 3. 首次全新初始化：生成 32 字节主密钥并双写持久化
+  // 【缺陷修复 G8】若已有任一密钥文件存在但内容无效，走到这里意味着旧密钥已不可用：
+  // 必须大声告警——新密钥无法解开既有 ENC: 密文，静默生成会把数据损坏伪装成密码错误。
+  const hadKeyMaterial = fs.existsSync(MASTER_KEY_FILE) || fs.existsSync(MASTER_KEY_BAK_FILE);
+  if (hadKeyMaterial) {
+    console.error('🔐 [主密钥] 主/备密钥文件均不可用，将生成新密钥；既有配置中的加密密码将无法解密，请从备份恢复 .master.key 或重新录入账号密码！');
+  }
   const newKey = crypto.randomBytes(32);
   const hexKey = newKey.toString('hex');
   try {
@@ -849,38 +834,19 @@ function getOrCreateMasterKey() {
 
 const masterKey = getOrCreateMasterKey();
 
+const { createPasswordCrypto } = require('./app/password_crypto');
+const passwordCrypto = createPasswordCrypto(masterKey, {
+  onError: (msg) => { console.error(`🔐 [密码加密] ${msg}`); },
+});
+
 function encryptPassword(plainText) {
-  if (!plainText || typeof plainText !== 'string') return '';
-  if (plainText.startsWith('ENC:')) return plainText; // 避免重复加密
-  try {
-    const iv = crypto.randomBytes(12);
-    const cipher = crypto.createCipheriv('aes-256-gcm', masterKey, iv);
-    let enc = cipher.update(plainText, 'utf8', 'hex');
-    enc += cipher.final('hex');
-    const authTag = cipher.getAuthTag().toString('hex');
-    return 'ENC:' + iv.toString('hex') + ':' + authTag + ':' + enc;
-  } catch (e) {
-    return plainText;
-  }
+  // 【缺陷修复 G8】加密失败直接抛错（模块实现），由 saveConfig 拦截，绝不回退明文落盘
+  return passwordCrypto.encryptPassword(plainText);
 }
 
 function decryptPassword(cipherText) {
-  if (!cipherText || typeof cipherText !== 'string') return '';
-  if (!cipherText.startsWith('ENC:')) return cipherText; // 兼容历史明文
-  try {
-    const parts = cipherText.split(':');
-    if (parts.length !== 4) return cipherText;
-    const iv = Buffer.from(parts[1], 'hex');
-    const authTag = Buffer.from(parts[2], 'hex');
-    const encrypted = parts[3];
-    const decipher = crypto.createDecipheriv('aes-256-gcm', masterKey, iv);
-    decipher.setAuthTag(authTag);
-    let dec = decipher.update(encrypted, 'hex', 'utf8');
-    dec += decipher.final('utf8');
-    return dec;
-  } catch (e) {
-    return cipherText;
-  }
+  // 【缺陷修复 G8】解密失败返回 '' 并记日志，绝不把密文本身当密码返回
+  return passwordCrypto.decryptPassword(cipherText);
 }
 
 // 2026-10-16 安全修复：接口层不再向前端明文返回账号密码。
@@ -1027,7 +993,7 @@ function loadConfig() {
 function saveConfig(cfg) {
   try {
     const configToSave = cfg || appConfig;
-    
+
     // 安全深拷贝用于加密落盘，内存中的密码仍然由各功能使用
     const diskClone = JSON.parse(JSON.stringify(configToSave));
     if (Array.isArray(diskClone.accounts)) {
@@ -1038,19 +1004,15 @@ function saveConfig(cfg) {
       }
     }
 
-    const jsonStr = JSON.stringify(diskClone, null, 2);
-    // 1. 原子写入主配置文件 (防崩溃/防断电截断)
-    atomicWriteFileSync(CONFIG_FILE, jsonStr, 'utf8');
-
-    // 2. 自动同步持久化备份文件 (app_config.json.bak)
-    if (Array.isArray(diskClone.accounts) || Array.isArray(diskClone.users)) {
-      try {
-        const BAK_FILE = CONFIG_FILE + '.bak';
-        atomicWriteFileSync(BAK_FILE, jsonStr, 'utf8');
-      } catch (e) {}
+    // 【缺陷修复 G8】落盘前断言：任一非空密码不是 ENC: 密文即中止保存。
+    // 旧实现加密失败回退明文且无校验，明文密码会被静默写进配置文件。
+    const plaintextLeak = (diskClone.accounts || []).find(a => a.password && !String(a.password).startsWith('ENC:'));
+    if (plaintextLeak) {
+      console.error('🔐 [保存配置] 检测到未加密的账号密码，已中止保存以防明文落盘');
+      return false;
     }
 
-    // 3. accounts.json 同样加密保护并原子写入
+    // accounts.json 载荷先行构建（加密异常时在任何文件写入前失败，避免半成品状态）
     const active = (configToSave.accounts || [])
       .filter(a => a.enabled !== false && a.features?.keepAlive !== false)
       .map(a => ({
@@ -1059,11 +1021,32 @@ function saveConfig(cfg) {
         password: encryptPassword(a.password),
         deviceCode: a.deviceCode
       }));
+    for (const entry of active) {
+      if (entry.password && !entry.password.startsWith('ENC:')) {
+        console.error('🔐 [保存配置] accounts.json 载荷含未加密密码，已中止保存');
+        return false;
+      }
+    }
     const ctyunJson = {
       keepAliveSeconds: configToSave.settings?.keepAliveSeconds || 60,
       accounts: active
     };
-    atomicWriteFileSync(ACCOUNTS_JSON, JSON.stringify(ctyunJson, null, 2), 'utf8');
+
+    const jsonStr = JSON.stringify(diskClone, null, 2);
+    // 【缺陷修复 G8】含凭据的落盘文件统一 0600（旧实现未传 mode，默认权限可被同机其他用户读）
+    // 1. 原子写入主配置文件 (防崩溃/防断电截断)
+    atomicWriteFileSync(CONFIG_FILE, jsonStr, 'utf8', 0o600);
+
+    // 2. 自动同步持久化备份文件 (app_config.json.bak)
+    if (Array.isArray(diskClone.accounts) || Array.isArray(diskClone.users)) {
+      try {
+        const BAK_FILE = CONFIG_FILE + '.bak';
+        atomicWriteFileSync(BAK_FILE, jsonStr, 'utf8', 0o600);
+      } catch (e) {}
+    }
+
+    // 3. accounts.json 同样加密保护并原子写入
+    atomicWriteFileSync(ACCOUNTS_JSON, JSON.stringify(ctyunJson, null, 2), 'utf8', 0o600);
     return true;
   } catch (e) {
     console.error('保存配置失败:', e);
@@ -1098,6 +1081,8 @@ const authManager = new AuthManager({
   sessionStore: authSessionStore,
   dataDir: DATA_DIR // 【安全整改 2026-10-15】供 AuthManager 写随机初始口令文件（0600）
 });
+// 【缺陷修复 G4】登录失败限速：同 IP+用户名 10 分钟内失败 10 次拦截（旧实现无限速可撞库）
+const loginRateLimiter = new LoginRateLimiter();
 
 // ==========================================================
 // 开关语义的单一权威入口 (暗线 A 的结构性修复)
@@ -3365,12 +3350,13 @@ if (require.main === module) {
 // ==========================================================
 // HTTP 路由与 API 服务
 // ==========================================================
-function jsonResponse(res, data, statusCode = 200) {
+function jsonResponse(res, data, statusCode = 200, extraHeaders = {}) {
+  const store = requestContext.getStore();
+  const cors = store && store.req ? corsHeadersFor(store.req, { allowedOrigins: CORS_ALLOWED_ORIGINS }) : {};
   res.writeHead(statusCode, {
     'Content-Type': 'application/json; charset=utf-8',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS'
+    ...cors,
+    ...extraHeaders
   });
   res.end(JSON.stringify(data));
 }
@@ -3401,18 +3387,10 @@ function serveStatic(res, filePath, contentType) {
   });
 }
 
-function parseJsonBody(req) {
-  return new Promise((resolve) => {
-    let body = '';
-    req.on('data', chunk => { body += chunk; });
-    req.on('end', () => {
-      try {
-        resolve(JSON.parse(body || '{}'));
-      } catch (e) {
-        resolve({});
-      }
-    });
-  });
+function parseJsonBody(req, opts) {
+  // 【缺陷修复 G5】实现下沉 app/http_util：字节上限(默认1MB)/413/400/aborted 必 settle。
+  // 旧实现字符串无上限累积 + 解析失败吞错返回 {} + 断开永不 settle。
+  return parseJsonBodyImpl(req, opts);
 }
 
 function getSessionFromReq(req, parsedUrl = null) {
@@ -3459,12 +3437,12 @@ async function getCtyunIndexHtml() {
   return cachedCtyunIndexHtml || '<!doctype html><html><head><title>天翼量子AI云电脑</title></head><body><div id="app"></div></body></html>';
 }
 
-async function proxyStaticAsset(res, targetUrl) {
+async function proxyStaticAsset(req, res, targetUrl) {
   if (ctyunStaticCache.has(targetUrl)) {
     const cached = ctyunStaticCache.get(targetUrl);
     res.writeHead(200, {
       'Content-Type': cached.contentType,
-      'Access-Control-Allow-Origin': '*',
+      ...(req ? corsHeadersFor(req, { allowedOrigins: CORS_ALLOWED_ORIGINS }) : {}),
       'Cache-Control': 'public, max-age=86400'
     });
     res.end(cached.buffer);
@@ -3498,7 +3476,7 @@ async function proxyStaticAsset(res, targetUrl) {
 
     res.writeHead(200, {
       'Content-Type': contentType,
-      'Access-Control-Allow-Origin': '*',
+      ...(req ? corsHeadersFor(req, { allowedOrigins: CORS_ALLOWED_ORIGINS }) : {}),
       'Cache-Control': 'public, max-age=86400'
     });
     res.end(buffer);
@@ -3508,15 +3486,32 @@ async function proxyStaticAsset(res, targetUrl) {
   }
 }
 
-const server = http.createServer(async (req, res) => {
+const server = http.createServer((req, res) => {
+  requestContext.run({ req }, () => {
+    handleHttpRequest(req, res).catch((err) => {
+      // 【缺陷修复 G5】主 handler 外层兜底（旧实现 async handler 抛错即 unhandledRejection，
+      // 请求挂死无响应）：按 err.statusCode 映射（413/400 等），其余 500，错误只记 message。
+      const status = err && err.statusCode ? err.statusCode : 500;
+      try { appendLog('System', `请求处理异常 (${req.method} ${String(req.url || '').slice(0, 120).replace(/([?&]token=)[^&]+/gi, '$1***')}): ${(err && err.message) || err}`, 'error'); } catch (e) {}
+      if (!res.headersSent) {
+        try { jsonResponse(res, { error: status === 500 ? '服务器内部错误' : err.message }, status); } catch (e) {}
+      } else {
+        try { res.end(); } catch (e) {}
+      }
+    });
+  });
+});
+// 【缺陷修复 G5】慢速/半开连接超时（旧实现未配置，slow-loris 可长期占用连接）
+server.requestTimeout = 120000;
+server.headersTimeout = 30000;
+
+async function handleHttpRequest(req, res) {
   const parsedUrl = new URL(req.url, `http://${req.headers.host}`);
   const pathname = parsedUrl.pathname;
 
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Headers': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS'
+      ...corsHeadersFor(req, { allowedOrigins: CORS_ALLOWED_ORIGINS })
     });
     res.end();
     return;
@@ -3620,12 +3615,15 @@ function rewardNeedsDesktop(prodId, prodType) {
   }
 
   // 2. API 请求代理拦截器 (规避跨域与 Origin 防盗链)
+  // 【缺陷修复 G6】代理路由已要求仪表盘会话鉴权：重写 URL 时附带当前会话 token
+  // （token 只发往本机代理，代理仅取 target 转发，上游永远看不到该参数）。
   const proxyBase = '/api/ctyun-proxy?target=';
+  const proxyToken = ${JSON.stringify(session.token || '')};
   function rewriteUrl(u) {
     if (!u || typeof u !== 'string') return u;
     if (u.startsWith(proxyBase)) return u;
     if (u.includes('.ctyun.cn:8810') || u.includes('.ctyun.cn:8816') || u.includes('-deskmgr.ctyun.cn')) {
-      return proxyBase + encodeURIComponent(u);
+      return proxyBase + encodeURIComponent(u) + '&token=' + encodeURIComponent(proxyToken);
     }
     return u;
   }
@@ -3724,7 +3722,11 @@ function rewardNeedsDesktop(prodId, prodType) {
 
       res.writeHead(200, {
         'Content-Type': 'text/html; charset=utf-8',
-        'Cache-Control': 'no-store'
+        'Cache-Control': 'no-store',
+        // 【缺陷修复 G9】注入页含会话 token（URL）与云账号认证数据：
+        // 禁 Referer 外泄目标 URL、禁 MIME 嗅探
+        'Referrer-Policy': 'no-referrer',
+        'X-Content-Type-Options': 'nosniff'
       });
       res.end(html);
     } catch (err) {
@@ -3738,7 +3740,7 @@ function rewardNeedsDesktop(prodId, prodType) {
   if (pathname.startsWith('/workers/') || pathname.includes('bbenc.worker.js')) {
     const filename = pathname.split('/').pop() || 'bbenc.worker.js';
     const targetUrl = 'https://pc.ctyun.cn/workers/' + filename;
-    await proxyStaticAsset(res, targetUrl);
+    await proxyStaticAsset(req, res, targetUrl);
     return;
   }
 
@@ -3746,7 +3748,7 @@ function rewardNeedsDesktop(prodId, prodType) {
   if (pathname.includes('bbEncDecoder') || pathname.endsWith('.wasm')) {
     const filename = pathname.split('/').pop();
     const targetUrl = 'https://pc.ctyun.cn/static/common/' + filename;
-    await proxyStaticAsset(res, targetUrl);
+    await proxyStaticAsset(req, res, targetUrl);
     return;
   }
 
@@ -3754,7 +3756,7 @@ function rewardNeedsDesktop(prodId, prodType) {
   if (pathname.startsWith('/ctyun-static/')) {
     const relPath = pathname.substring(13).replace(/^\/+/, '');
     const targetUrl = 'https://pc.ctyun.cn/' + relPath;
-    await proxyStaticAsset(res, targetUrl);
+    await proxyStaticAsset(req, res, targetUrl);
     return;
   }
 
@@ -3762,11 +3764,17 @@ function rewardNeedsDesktop(prodId, prodType) {
   if (pathname === '/api/ctyun-proxy') {
     if (req.method === 'OPTIONS') {
       res.writeHead(204, {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS'
+        ...corsHeadersFor(req, { allowedOrigins: CORS_ALLOWED_ORIGINS })
       });
       res.end();
+      return;
+    }
+
+    // 【缺陷修复 G6】旧实现完全无鉴权：任何未登录访问者都能借本机出口请求天翼云内网面。
+    // 现要求仪表盘会话（注入页的 rewriteUrl 会自动附带 token 参数，见 /desktop-view）。
+    const session = getSessionFromReq(req, parsedUrl);
+    if (!session) {
+      jsonResponse(res, { error: 'Unauthorized' }, 401);
       return;
     }
 
@@ -3776,62 +3784,65 @@ function rewardNeedsDesktop(prodId, prodType) {
       return;
     }
 
-    try {
-      const parsedTarget = new URL(targetUrl);
-      if (!parsedTarget.hostname.endsWith('.ctyun.cn')) {
-        jsonResponse(res, { error: 'Invalid proxy target' }, 403);
-        return;
-      }
+    // 【缺陷修复 G6】精确 allowlist：仅 https + ctyun.cn 精确/子域 + 端口白名单，
+    // 拒用户信息与 IP 字面量（旧实现仅 endsWith('.ctyun.cn') 一条）。
+    const validation = validateProxyTarget(targetUrl);
+    if (!validation.ok) {
+      jsonResponse(res, { error: validation.error }, validation.statusCode);
+      return;
+    }
+    const parsedTarget = validation.url;
 
-      const bodyChunks = [];
-      req.on('data', chunk => bodyChunks.push(chunk));
-      req.on('end', async () => {
-        const bodyBuffer = Buffer.concat(bodyChunks);
-        const outgoingHeaders = {};
-        for (const [k, v] of Object.entries(req.headers)) {
-          const lk = k.toLowerCase();
-          if (lk === 'host' || lk === 'origin' || lk === 'referer' || lk === 'content-length') continue;
-          outgoingHeaders[k] = v;
+    // 请求体上限 10MB（旧实现无上限累积）；超限/断开由外层 catch 按 statusCode 映射
+    const bodyBuffer = await readRawBody(req, { maxBytes: PROXY_BODY_MAX_BYTES });
+
+    // 【缺陷修复 G6】敏感头不转发：authorization/cookie 是仪表盘凭据，转发即泄漏给上游
+    const outgoingHeaders = buildProxyHeaders(req.headers, parsedTarget);
+    if (bodyBuffer.length > 0) {
+      outgoingHeaders['content-length'] = bodyBuffer.length;
+    }
+
+    await new Promise((resolve) => {
+      const proxyReq = https.request(parsedTarget, {
+        method: req.method,
+        headers: outgoingHeaders,
+        // 【缺陷修复 G6】恢复 TLS 验证（旧实现 rejectUnauthorized:false）。
+        // 2026-10-24 只读探针实测 pc/desk.ctyun.cn:443/8810/8816 证书链 Verify code 均为 0。
+        rejectUnauthorized: true,
+        timeout: PROXY_UPSTREAM_TIMEOUT_MS,
+      }, proxyRes => {
+        const respHeaders = {};
+        for (const [k, v] of Object.entries(proxyRes.headers)) {
+          if (k.toLowerCase() === 'set-cookie') continue;
+          respHeaders[k] = v;
         }
-        outgoingHeaders['host'] = parsedTarget.host;
-        outgoingHeaders['origin'] = 'https://pc.ctyun.cn';
-        outgoingHeaders['referer'] = 'https://pc.ctyun.cn/';
-        if (bodyBuffer.length > 0) {
-          outgoingHeaders['content-length'] = bodyBuffer.length;
-        }
+        Object.assign(respHeaders, corsHeadersFor(req, { allowedOrigins: CORS_ALLOWED_ORIGINS }));
+        res.writeHead(proxyRes.statusCode, respHeaders);
+        proxyRes.pipe(res);
+        proxyRes.on('end', resolve);
+        proxyRes.on('error', () => resolve());
+      });
 
-        const clientModule = parsedTarget.protocol === 'http:' ? http : https;
-        const proxyReq = clientModule.request(targetUrl, {
-          method: req.method,
-          headers: outgoingHeaders,
-          rejectUnauthorized: false
-        }, proxyRes => {
-          const respHeaders = {};
-          for (const [k, v] of Object.entries(proxyRes.headers)) {
-            if (k.toLowerCase() === 'set-cookie') continue;
-            respHeaders[k] = v;
-          }
-          respHeaders['access-control-allow-origin'] = '*';
-          respHeaders['access-control-allow-headers'] = '*';
-          respHeaders['access-control-allow-methods'] = 'GET, POST, PUT, DELETE, OPTIONS';
-
-          res.writeHead(proxyRes.statusCode, respHeaders);
-          proxyRes.pipe(res);
-        });
-
-        proxyReq.on('error', err => {
+      proxyReq.on('timeout', () => {
+        proxyReq.destroy(new Error('Upstream timeout'));
+      });
+      proxyReq.on('error', err => {
+        if (!res.headersSent) {
           res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ error: 'Proxy request failed: ' + err.message }));
-        });
-
-        if (bodyBuffer.length > 0) {
-          proxyReq.write(bodyBuffer);
+        } else {
+          try { res.end(); } catch (e) {}
         }
-        proxyReq.end();
+        resolve();
       });
-    } catch (e) {
-      jsonResponse(res, { error: 'Malformed proxy request: ' + e.message }, 400);
-    }
+      // 客户端断开即终止上游请求（旧实现上游继续跑完并写已断开的 res）
+      req.on('aborted', () => { try { proxyReq.destroy(); } catch (e) {} resolve(); });
+
+      if (bodyBuffer.length > 0) {
+        proxyReq.write(bodyBuffer);
+      }
+      proxyReq.end();
+    });
     return;
   }
 
@@ -3851,7 +3862,7 @@ function rewardNeedsDesktop(prodId, prodType) {
       serveStatic(res, file, type);
     } else {
       const targetUrl = 'https://pc.ctyun.cn' + pathname;
-      await proxyStaticAsset(res, targetUrl);
+      await proxyStaticAsset(req, res, targetUrl);
     }
     return;
   }
@@ -3905,7 +3916,7 @@ function rewardNeedsDesktop(prodId, prodType) {
       'Cache-Control': 'no-cache, no-transform',
       'Connection': 'keep-alive',
       'X-Accel-Buffering': 'no',
-      'Access-Control-Allow-Origin': '*'
+      ...corsHeadersFor(req, { allowedOrigins: CORS_ALLOWED_ORIGINS })
     });
     // 立即下发初始心跳
     res.write(': connected\n\n');
@@ -3937,12 +3948,21 @@ function rewardNeedsDesktop(prodId, prodType) {
   // 3. 用户系统 (登录、注册、修改个人密码、当前用户状态)
   if (req.method === 'POST' && pathname === '/api/auth/login') {
     const body = await parseJsonBody(req);
+    // 【缺陷修复 G4】登录限速：按连接 IP + 用户名计数（不采信可伪造的转发头）
+    const clientIp = req.socket?.remoteAddress || '';
+    if (loginRateLimiter.isBlocked(clientIp, body.username)) {
+      appendLog('Auth', `登录被限速拦截: IP=${clientIp} 用户=[${body.username}]`, 'warning');
+      jsonResponse(res, { success: false, error: '登录失败次数过多，请 10 分钟后再试' }, 429);
+      return;
+    }
     const remember = body.remember === true; // "30 天内免登录"勾选 ⇒ 会话落盘 + 前端持久存储
     const result = authManager.login(body.username, body.password, remember);
     if (result.success) {
+      loginRateLimiter.recordSuccess(clientIp, body.username);
       appendLog('Auth', `用户 [${body.username}] 登录成功${remember ? '（已勾选 30 天内免登录）' : ''}`, 'info');
       jsonResponse(res, result);
     } else {
+      loginRateLimiter.recordFailure(clientIp, body.username);
       jsonResponse(res, result, 400);
     }
     return;
@@ -3979,14 +3999,20 @@ function rewardNeedsDesktop(prodId, prodType) {
       return;
     }
     const body = await parseJsonBody(req);
-    const newPwd = (body.newPassword || '').trim();
-    if (!newPwd || newPwd.length < 5) {
-      jsonResponse(res, { error: '新密码长度至少5位' }, 400);
+    // 【缺陷修复 G4】旧实现不验当前密码且只要求 ≥5 位：拿到任一会话即可改密接管账号。
+    // 现走 AuthManager.changeOwnPassword：验当前密码 + 统一策略(≥8) + 吊销其他会话（保留当前）。
+    const result = authManager.changeOwnPassword(
+      session.userId,
+      typeof body.currentPassword === 'string' ? body.currentPassword : '',
+      (body.newPassword || '').trim(),
+      session.token
+    );
+    if (!result.success) {
+      jsonResponse(res, { error: result.error }, 400);
       return;
     }
-    authManager.updateUserPassword(session.userId, newPwd);
-    appendLog('Auth', `用户 [${session.username}] 修改了自己的登录密码`, 'info');
-    jsonResponse(res, { success: true, message: '密码修改成功' });
+    appendLog('Auth', `用户 [${session.username}] 修改了自己的登录密码（其他会话已吊销）`, 'info');
+    jsonResponse(res, { success: true, message: '密码修改成功，其他设备的登录已失效' });
     return;
   }
 
@@ -4100,14 +4126,16 @@ function rewardNeedsDesktop(prodId, prodType) {
       const userId = pathname.split('/')[4];
       const body = await parseJsonBody(req);
       const newPwd = (body.newPassword || '').trim();
-      if (!newPwd || newPwd.length < 5) {
-        jsonResponse(res, { error: '新密码长度至少5位' }, 400);
+      const policyError = validatePasswordPolicy(newPwd);
+      if (policyError) {
+        jsonResponse(res, { error: policyError }, 400);
         return;
       }
+      // updateUserPassword 内部会吊销该用户全部会话（管理员重置不保留任何会话）
       const ok = authManager.updateUserPassword(userId, newPwd);
       if (ok) {
-        appendLog('Admin', `管理员修改了用户 [${userId}] 的登录密码`, 'warning');
-        jsonResponse(res, { success: true, message: '用户密码已更新' });
+        appendLog('Admin', `管理员修改了用户 [${userId}] 的登录密码（该用户全部会话已吊销）`, 'warning');
+        jsonResponse(res, { success: true, message: '用户密码已更新，该用户需重新登录' });
       } else {
         jsonResponse(res, { error: '用户不存在' }, 404);
       }
@@ -5748,6 +5776,9 @@ function rewardNeedsDesktop(prodId, prodType) {
         timestamp: Date.now()
       };
 
+      // 【缺陷修复 G9】响应含明文密码与完整认证包：禁止任何缓存留存。
+      // 字段削减（password/secretKey 是否可删、token 能否移出 directViewUrl）依赖仓外
+      // 前端消费方式，无法在本仓隔离验证，列入修复报告人工决策，本轮不砍字段。
       jsonResponse(res, {
         success: true,
         user: acc.user,
@@ -5760,7 +5791,7 @@ function rewardNeedsDesktop(prodId, prodType) {
         desktopUrl: `https://pc.ctyun.cn/#/desktop-list`,
         desktopName: desktop.objName || desktop.desktopName || '云电脑',
         displayConfig: displayCfg
-      });
+      }, 200, { 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' });
     } catch (e) {
       jsonResponse(res, { error: e.message }, 500);
     }
@@ -6359,7 +6390,7 @@ function rewardNeedsDesktop(prodId, prodType) {
     res.writeHead(200, {
       'Content-Type': 'application/json; charset=utf-8',
       'Content-Disposition': `attachment; filename="ctyun_config_backup_${Date.now()}.json"`,
-      'Access-Control-Allow-Origin': '*'
+      ...corsHeadersFor(req, { allowedOrigins: CORS_ALLOWED_ORIGINS })
     });
     res.end(JSON.stringify(exportData, null, 2));
     return;
@@ -6373,7 +6404,8 @@ function rewardNeedsDesktop(prodId, prodType) {
       return;
     }
 
-    const body = await parseJsonBody(req);
+    // 配置备份文件体积可大于普通 API 请求，导入路由显式放宽到 10MB（仍有上限，不再无界）
+    const body = await parseJsonBody(req, { maxBytes: 10 * 1024 * 1024 });
     const importAccounts = Array.isArray(body.accounts) ? body.accounts : [];
     if (importAccounts.length === 0) {
       jsonResponse(res, { error: '导入失败：未在 JSON 文件中解析到合法的 accounts 数组' }, 400);
@@ -6551,7 +6583,19 @@ function rewardNeedsDesktop(prodId, prodType) {
 
   // 21. 重启保活守护
   if (req.method === 'POST' && pathname === '/api/keeper/restart') {
-    appendLog('Keeper', '收到重启指令，正在重置所有保活周期...', 'warning');
+    // 【缺陷修复 G9】旧实现完全无鉴权：任何未登录者都能 POST 重置全部保活通道
+    // （断开所有账号长连接）。现要求管理员会话，并记审计日志（含操作者）。
+    const session = getSessionFromReq(req, parsedUrl);
+    if (!session) {
+      jsonResponse(res, { error: '未授权：请登录后再操作' }, 401);
+      return;
+    }
+    if (session.role !== 'admin') {
+      appendLog('Keeper', `非管理员 [${session.username}] 尝试重启保活守护，已拒绝`, 'warning');
+      jsonResponse(res, { error: '权限不足：仅管理员可重启保活守护' }, 403);
+      return;
+    }
+    appendLog('Keeper', `管理员 [${session.username}] 触发重启指令，正在重置所有保活周期...`, 'warning');
     for (const [id, client] of clientInstances.entries()) {
       client.stopKeepAliveWorker();
     }
@@ -6561,7 +6605,7 @@ function rewardNeedsDesktop(prodId, prodType) {
   }
 
   jsonResponse(res, { error: 'Not Found' }, 404);
-});
+}
 
 if (require.main === module) {
   // 【安全整改 2026-10-15】默认只监听本地回环，裸机部署不再把仪表盘暴露到局域网/公网。

@@ -1,5 +1,7 @@
 const { executeNativeAiChat, executeNativeSign, executeNativeHang } = require('./native_tasks');
-const { executeBrowserHang } = require('./browser_hang');
+const browserHangModule = require('./browser_hang');
+const { executeBrowserHang } = browserHangModule;
+const { attemptRedeemOrder } = require('./redeem_order');
 
 function getBeijingDate() {
   const d = new Date();
@@ -16,6 +18,65 @@ function getBeijingTimeString() {
   return d.toLocaleString('sv-SE', { timeZone: 'Asia/Shanghai' });
 }
 
+const CRON_FIELD_RANGES = [
+  { name: '分钟', min: 0, max: 59 },
+  { name: '小时', min: 0, max: 23 },
+  { name: '日期', min: 1, max: 31 },
+  { name: '月份', min: 1, max: 12 },
+  { name: '星期', min: 0, max: 7 }, // 0 与 7 均为周日（标准 Cron）
+];
+
+/**
+ * 校验单个 Cron 字段，返回错误字符串或 null。
+ * 支持：*、数字、a-b、* /step、a-b/step、逗号列表（step 不可为 0，数值必须在字段范围内）。
+ */
+function validateCronField(field, range) {
+  if (field === undefined || field === '') return `${range.name}字段不能为空`;
+  for (const part of field.split(',')) {
+    if (part === '') return `${range.name}字段存在空项`;
+    let base = part;
+    if (part.includes('/')) {
+      const segs = part.split('/');
+      if (segs.length !== 2) return `${range.name}字段 "${part}" 格式非法`;
+      base = segs[0];
+      if (!/^\d+$/.test(segs[1])) return `${range.name}字段 "${part}" 的步长不是合法数字`;
+      const step = parseInt(segs[1], 10);
+      if (step < 1) return `${range.name}字段 "${part}" 的步长必须 ≥ 1（零步长无意义）`;
+      if (base !== '*' && !base.includes('-')) return `${range.name}字段 "${part}" 的步长只能用于 * 或范围`;
+    }
+    if (base === '*') continue;
+    if (base.includes('-')) {
+      const segs = base.split('-');
+      if (segs.length !== 2 || !/^\d+$/.test(segs[0]) || !/^\d+$/.test(segs[1])) {
+        return `${range.name}字段 "${part}" 的范围格式非法`;
+      }
+      const [a, b] = segs.map(Number);
+      if (a > b) return `${range.name}字段 "${part}" 的范围起始大于结束`;
+      if (a < range.min || b > range.max) return `${range.name}字段 "${part}" 越界（允许 ${range.min}-${range.max}）`;
+    } else {
+      if (!/^\d+$/.test(base)) return `${range.name}字段 "${part}" 不是合法数字`;
+      const v = parseInt(base, 10);
+      if (v < range.min || v > range.max) return `${range.name}字段 "${part}" 越界（允许 ${range.min}-${range.max}）`;
+    }
+  }
+  return null;
+}
+
+/**
+ * 校验五字段 Cron 表达式。非法时返回 { ok:false, error }，供配置保存与调度入口提前暴露错误，
+ * 避免旧实现「非法字段静默永假、任务永远不触发且无任何提示」。
+ */
+function validateCronExpression(expr) {
+  if (!expr || typeof expr !== 'string' || !expr.trim()) return { ok: false, error: 'Cron 表达式不能为空' };
+  const parts = expr.trim().split(/\s+/);
+  if (parts.length !== 5) return { ok: false, error: `Cron 表达式必须为 5 个字段（分 时 日 月 周），当前 ${parts.length} 个` };
+  for (let i = 0; i < 5; i++) {
+    const err = validateCronField(parts[i], CRON_FIELD_RANGES[i]);
+    if (err) return { ok: false, error: err };
+  }
+  return { ok: true };
+}
+
 function matchCronField(field, val) {
   if (field === '*') return true;
   const parts = field.split(',');
@@ -23,6 +84,7 @@ function matchCronField(field, val) {
     if (part.includes('/')) {
       const [range, step] = part.split('/');
       const stepNum = parseInt(step, 10);
+      if (!Number.isFinite(stepNum) || stepNum < 1) continue; // 零步长/非法步长不匹配（校验层会另行报错）
       if (range === '*') {
         if (val % stepNum === 0) return true;
       } else {
@@ -39,10 +101,16 @@ function matchCronField(field, val) {
   return false;
 }
 
+/**
+ * Cron 匹配（标准语义）：分/时/月恒为 AND；日期(dom) 与星期(dow) **都**被限定时按标准 Cron 的 OR 语义
+ * （例如 `0 9 1 * 1` = 每月 1 号或每周一 09:00），仅限定其一时按该项匹配。
+ * 仓库文档/UI 未声明自定义语义，故从旧「全 AND」修正为标准语义，并以 test/cron.test.js 固定。
+ * 星期字段 7 与 0 同为周日。
+ */
 function shouldRunCron(cronExpr, date = new Date()) {
   if (!cronExpr) return false;
+  if (!validateCronExpression(cronExpr).ok) return false;
   const parts = cronExpr.trim().split(/\s+/);
-  if (parts.length !== 5) return false;
   const [minStr, hourStr, domStr, monthStr, dowStr] = parts;
   const min = date.getMinutes();
   const hour = date.getHours();
@@ -50,14 +118,52 @@ function shouldRunCron(cronExpr, date = new Date()) {
   const month = date.getMonth() + 1;
   const dow = date.getDay();
 
-  return matchCronField(minStr, min) &&
-         matchCronField(hourStr, hour) &&
-         matchCronField(domStr, dom) &&
-         matchCronField(monthStr, month) &&
-         matchCronField(dowStr, dow);
+  if (!matchCronField(minStr, min)) return false;
+  if (!matchCronField(hourStr, hour)) return false;
+  if (!matchCronField(monthStr, month)) return false;
+  const domOk = matchCronField(domStr, dom);
+  const dowOk = matchCronField(dowStr, dow) || (dow === 0 && matchCronField(dowStr, 7));
+  const domRestricted = domStr !== '*';
+  const dowRestricted = dowStr !== '*';
+  if (domRestricted && dowRestricted) return domOk || dowOk;
+  return domOk && dowOk;
+}
+
+/**
+ * 统一任务状态枚举（任务书要求）：所有完成判定（开机补跑 / 主流程最终判定 / 通知口径）
+ * 只允许使用这组状态，禁止再各处用布尔值拼凑「完成」。
+ */
+const TASK_STATUS = Object.freeze({
+  PENDING: 'pending',     // 已开启、未达成
+  RUNNING: 'running',     // 执行中
+  COMPLETED: 'completed', // 有权威证据确认达成（官方任务状态 / 兑换日期标记）
+  SKIPPED: 'skipped',     // 未开启 / 被分项 Cron 管辖 / 今日策略未命中 / 平台不适用
+  FAILED: 'failed',       // 本轮执行明确失败
+  UNKNOWN: 'unknown',     // 状态证据不可得（如官方任务刷新失败）——绝不得按完成处理
+});
+
+/**
+ * 自动兑换今日是否命中策略（从 runAllAccounts 的内联策略判定抽出，供完成判定复用同一口径）。
+ * lastRedeemDate === todayStr 时视为今日已执行（返回 false，不再需要执行）。
+ */
+function isRedeemDueToday(rConf, todayStr) {
+  if (!rConf || !rConf.prodId) return false;
+  if (rConf.lastRedeemDate === todayStr) return false;
+  const cstDay = parseInt(todayStr.split('-')[2], 10);
+  const ym = todayStr.split('-');
+  const lastDayOfMonth = new Date(Number(ym[0]), Number(ym[1]), 0).getDate();
+  if (rConf.scheduleType === 'daily') return true;
+  if (rConf.scheduleType === 'interval_days') {
+    if (!rConf.lastRedeemDate) return true;
+    const diffDays = Math.floor((new Date(todayStr).getTime() - new Date(rConf.lastRedeemDate).getTime()) / (1000 * 3600 * 24));
+    return diffDays >= (parseInt(rConf.intervalDays) || 30);
+  }
+  const days = Array.isArray(rConf.monthlyDays) ? rConf.monthlyDays : [-1];
+  return days.includes(cstDay) || (days.includes(-1) && cstDay === lastDayOfMonth);
 }
 
 class TaskScheduler {
+
   constructor({ getAccounts, getSettings, getClient, appendLog, sendNotification, saveConfig }) {
     this.getAccounts = getAccounts;
     this.getSettings = getSettings;
@@ -97,8 +203,10 @@ class TaskScheduler {
     // 同时启动轻量级 30 秒轮询看门狗：防止设置热更新失效、跨日兜底，并支持高级分项Cron自定义触发
     if (this.timer) clearInterval(this.timer);
     this.timer = setInterval(() => this.heartbeatTick(), 30000);
-    // 立即执行一次开机/重启检测
-    setTimeout(() => this.checkStartupCatchup(), 2000);
+    // 立即执行一次开机/重启检测（句柄必须保存：旧实现无句柄，stop() 清不掉它，
+    // 服务停止后 2 秒仍可能触发补跑 —— 新发现 S8）
+    if (this.startupTimer) clearTimeout(this.startupTimer);
+    this.startupTimer = setTimeout(() => { this.startupTimer = null; this.checkStartupCatchup(); }, 2000);
   }
 
   stop() {
@@ -110,6 +218,68 @@ class TaskScheduler {
       clearTimeout(this.nextRunTimer);
       this.nextRunTimer = null;
     }
+    if (this.startupTimer) {
+      clearTimeout(this.startupTimer);
+      this.startupTimer = null;
+    }
+    // 停止时取消在跑的浏览器真挂机（只终止其自有子进程），避免孤儿浏览器残留
+    try { browserHangModule.cancelAllBrowserHangs?.(); } catch (e) {}
+  }
+
+  /** 分项任务失败的统一脱敏日志（旧实现多处 .catch(()=>{}) 静默吞错，排障无据）。只记错误 message，不记任何凭据/报文。 */
+  logTaskError(taskLabel, accName, err) {
+    const msg = (err && err.message) ? err.message : String(err || '未知错误');
+    this.appendLog('Scheduler', `[${accName}] 分项任务 [${taskLabel}] 执行失败: ${msg}`, 'error');
+  }
+
+  /**
+   * 统一完成判定（单一事实来源）：返回该账号五类任务的 TASK_STATUS。
+   * - 官方任务类（sign/aiChat/cloudHang/browserHang）以官方任务中心为唯一证据；
+   *   browserHang 的目标与 cloudHang 同为官方「使用1小时」任务，以同一证据判定，但独立计列，
+   *   堵住旧实现「补跑/最终判定/通知三处清单不一致、browserHang 与 autoRedeem 被系统性遗漏」。
+   * - refreshFailed=true（官方任务刷新失败）时官方类一律 UNKNOWN —— 绝不用旧缓存判完成（新发现 S7）。
+   * - redeem 以 redeemConfig 的日期与今日策略判定（仓内无订单状态查询接口）。
+   * opts.exclude 为分项管辖表：被管辖的分项记 SKIPPED（由其 Cron 负责，不纳入本次判定）。
+   */
+  evaluateAccountCompletion(acc, client, opts = {}) {
+    const S = TASK_STATUS;
+    const exclude = opts.exclude || {};
+    const todayStr = opts.todayStr || getBeijingDateStr();
+    const states = {};
+    const official = (taskKey, taskName) => {
+      if (!this.taskGate(acc, taskKey, client)) return { status: S.SKIPPED };
+      if (exclude[taskKey]) return { status: S.SKIPPED };
+      if (opts.refreshFailed) return { status: S.UNKNOWN };
+      const tasks = client?.metrics?.officialTasks;
+      if (!Array.isArray(tasks)) return { status: S.UNKNOWN };
+      const t = tasks.find(x => x.name && x.name.includes(taskName));
+      if (!t) return { status: S.UNKNOWN };
+      return { status: (t.status === 2 || (t.total > 0 && t.current >= t.total)) ? S.COMPLETED : S.PENDING };
+    };
+    if (acc.platform === 'ydpc' || acc.platform === 'ecloud') {
+      for (const k of ['sign', 'aiChat', 'cloudHang', 'browserHang', 'redeem']) states[k] = { status: S.SKIPPED };
+      return states;
+    }
+    states.sign = official('sign', '登录AI云电脑');
+    states.aiChat = official('aiChat', 'AI对话');
+    states.cloudHang = official('cloudHang', '使用1小时');
+    states.browserHang = official('browserHang', '使用1小时');
+    // 自动兑换
+    if (!acc.features?.autoRedeem) states.redeem = { status: S.SKIPPED };
+    else if (exclude.redeem) states.redeem = { status: S.SKIPPED };
+    else {
+      const rConf = acc.redeemConfig || {};
+      if (!rConf.prodId) states.redeem = { status: S.SKIPPED };
+      else if (rConf.lastRedeemDate === todayStr) states.redeem = { status: S.COMPLETED };
+      else if (isRedeemDueToday(rConf, todayStr)) states.redeem = { status: S.PENDING };
+      else states.redeem = { status: S.SKIPPED };
+    }
+    return states;
+  }
+
+  /** 全部任务是否真正完成：每项必须为 COMPLETED 或 SKIPPED，出现 PENDING/UNKNOWN/FAILED 即未完成。 */
+  static allStatesCompleted(states) {
+    return Object.values(states).every(s => s.status === TASK_STATUS.COMPLETED || s.status === TASK_STATUS.SKIPPED);
   }
 
   getTargetTimes() {
@@ -155,27 +325,20 @@ class TaskScheduler {
       if (!acc.enabled) continue;
       if (acc.platform === 'ydpc') continue; // 移动云保活为常态巡检，无需达成度判定
       if (acc.platform === 'ecloud') continue; // 移动公众保活为常态巡检，无官方任务达成度可言
-      const f = acc.features || {};
       const client = this.getClient(acc);
+      // 官方任务状态刷新失败 ⇒ 该账号状态未知（UNKNOWN），绝不沿用旧缓存判完成（新发现 S7）；
+      // 旧实现 catch 后直接读旧 officialTasks，缓存里的昨日「已完成」会让补跑误判全达成而漏跑。
+      let refreshFailed = false;
       try {
         await client.refreshOfficialTasks();
-      } catch (e) {}
-      const tasks = client?.metrics?.officialTasks || [];
-
-      // 仅考核用户自身开启且未被分项 Cron 管辖的任务项是否达成
-      const loginTask = tasks.find(t => t.name.includes('登录AI云电脑'));
-      const aiTask = tasks.find(t => t.name.includes('AI对话'));
-      const hangTask = tasks.find(t => t.name.includes('使用1小时'));
-
-      if (this.taskGate(acc, 'sign') && !subCronMap.sign && !(loginTask && (loginTask.status === 2 || loginTask.current >= loginTask.total))) {
-        allDone = false;
-        break;
+      } catch (e) {
+        refreshFailed = true;
+        this.appendLog('Scheduler', `[${acc.name}] 官方任务状态刷新失败，本轮按状态未知处理（不判定完成）: ${(e && e.message) || e}`, 'warning');
       }
-      if (this.taskGate(acc, 'aiChat') && !subCronMap.aiChat && !(aiTask && (aiTask.status === 2 || aiTask.current >= aiTask.total))) {
-        allDone = false;
-        break;
-      }
-      if (this.taskGate(acc, 'cloudHang') && !subCronMap.cloudHang && !(hangTask && (hangTask.status === 2 || hangTask.current >= hangTask.total))) {
+      // 统一完成判定（含 browserHang 与 autoRedeem —— 旧实现只查 sign/aiChat/cloudHang，
+      // 与 anyUngovernedTask 的任务清单不一致，导致这两类未完成时仍被判全部完成，新发现 S6）
+      const states = this.evaluateAccountCompletion(acc, client, { exclude: subCronMap, refreshFailed, todayStr });
+      if (!TaskScheduler.allStatesCompleted(states)) {
         allDone = false;
         break;
       }
@@ -319,6 +482,21 @@ class TaskScheduler {
     const cron = settings.cron || {};
     const subCronActive = this.hasActiveSubCronRules();
 
+    // 分项 Cron 表达式合法性巡检：非法表达式只告警一次（shouldRunCron 对非法值恒假，
+    // 旧实现静默永不触发、无任何提示 —— 任务书要求非法字段显式报错）
+    if (cron.enableSubCron) {
+      if (!this._cronWarned) this._cronWarned = new Set();
+      for (const [label, expr] of [['签到打卡', cron.signCron], ['AI 对话', cron.aiChatCron], ['云电脑挂机', cron.cloudHangCron], ['浏览器真挂机', cron.browserHangCron], ['自动兑换', cron.redeemCron]]) {
+        if (expr && expr.trim()) {
+          const v = validateCronExpression(expr.trim());
+          if (!v.ok && !this._cronWarned.has(expr)) {
+            this._cronWarned.add(expr);
+            this.appendLog('Scheduler', `⚠️ 分项 Cron [${label}] 表达式非法，已忽略该分项: ${v.error}（表达式: ${expr}）`, 'error');
+          }
+        }
+      }
+    }
+
     // 1. 如果未启用辅助规则，或者虽然启用了辅助规则但没有填写任何具体规则：
     // 则以【每日任务准时触发时间点 (主调度中心)】为主触发机制
     if (!subCronActive) {
@@ -353,12 +531,14 @@ class TaskScheduler {
                   this.saveConfig();
                 }
               })
-              .catch(() => {});
+              .catch(err => this.logTaskError('签到打卡', acc.name, err));
           }
         }
       }
     } else if (targetTimes.includes(currentHm) && this.lastCompletedDate !== todayStr) {
-      // 辅助规则未配置该项，按主时间点兜底
+      // 辅助规则未配置该项，按主时间点兜底（兜底分支同样必须登记分钟标记，
+      // 否则同分钟下一次 30 秒巡检会重复启动 —— 新发现 S3）
+      this.lastTriggerMinute = currentMinKey;
       for (const acc of accounts) {
         if (this.taskGate(acc, 'sign')) {
           const client = this.getClient(acc);
@@ -369,7 +549,7 @@ class TaskScheduler {
                 this.saveConfig();
               }
             })
-            .catch(() => {});
+            .catch(err => this.logTaskError('签到打卡', acc.name, err));
         }
       }
     }
@@ -382,16 +562,17 @@ class TaskScheduler {
         for (const acc of accounts) {
           if (this.taskGate(acc, 'aiChat')) {
             const client = this.getClient(acc);
-            executeNativeAiChat(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl)).catch(() => {});
+            executeNativeAiChat(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl)).catch(err => this.logTaskError('AI 对话', acc.name, err));
           }
         }
       }
     } else if (targetTimes.includes(currentHm) && this.lastCompletedDate !== todayStr) {
-      // 辅助规则未配置该项，按主时间点兜底
+      // 辅助规则未配置该项，按主时间点兜底（登记分钟标记防同分钟重复触发 —— 新发现 S3）
+      this.lastTriggerMinute = currentMinKey;
       for (const acc of accounts) {
         if (this.taskGate(acc, 'aiChat')) {
           const client = this.getClient(acc);
-          executeNativeAiChat(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl)).catch(() => {});
+          executeNativeAiChat(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl)).catch(err => this.logTaskError('AI 对话', acc.name, err));
         }
       }
     }
@@ -404,7 +585,7 @@ class TaskScheduler {
         for (const acc of accounts) {
           if (this.taskGate(acc, 'cloudHang')) {
             const client = this.getClient(acc);
-            executeNativeHang(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl)).catch(() => {});
+            executeNativeHang(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl)).catch(err => this.logTaskError('云电脑挂机', acc.name, err));
           }
         }
       }
@@ -413,20 +594,28 @@ class TaskScheduler {
     // 2.3b 浏览器真挂机分项规则（每天 3:00，挂 61 分钟）
     if (cron.browserHangCron?.trim()) {
       if (shouldRunCron(cron.browserHangCron.trim(), bj)) {
+        // 命中分支必须登记分钟标记（旧实现唯独此分支漏记，同一分钟内 30 秒巡检
+        // 会二次启动 61 分钟浏览器挂机，与其他账号共享 profile 时还会互踩 —— 新发现 S4）
+        this.lastTriggerMinute = currentMinKey;
         this.appendLog('Scheduler', `⏰ 触发分项辅助规则 [浏览器真挂机] (Cron: ${cron.browserHangCron})...`, 'info');
         for (const acc of accounts) {
           if (this.taskGate(acc, 'browserHang') && acc.platform !== 'ydpc' && acc.platform !== 'ecloud') {
             const client = this.getClient(acc);
-            executeBrowserHang(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl)).catch(() => {});
+            executeBrowserHang(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl)).catch(err => this.logTaskError('浏览器真挂机', acc.name, err));
           }
         }
       }
     } else if (targetTimes.includes(currentHm) && this.lastCompletedDate !== todayStr) {
-      // 辅助规则未配置该项，按主时间点兜底
+      // 辅助规则未配置该项，按主时间点兜底。
+      // 【缺陷修复 S5】旧实现此分支门控用 cloudHang 且调用 executeNativeHang（原生挂机），
+      // 与本节标题/注释声明的「浏览器真挂机兜底」不一致：只开启 browserHang 的账号在主时间点
+      // 永远等不到浏览器挂机。现按注释意图修正为 browserHang 门控 + executeBrowserHang；
+      // 原生挂机的主时间点兜底由 scheduleNextRun → runAllAccounts('point_in_time') 承担，不在此处。
+      this.lastTriggerMinute = currentMinKey;
       for (const acc of accounts) {
-        if (this.taskGate(acc, 'cloudHang') && acc.platform !== 'ydpc' && acc.platform !== 'ecloud') {
+        if (this.taskGate(acc, 'browserHang') && acc.platform !== 'ydpc' && acc.platform !== 'ecloud') {
           const client = this.getClient(acc);
-          executeNativeHang(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl)).catch(() => {});
+          executeBrowserHang(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl)).catch(err => this.logTaskError('浏览器真挂机', acc.name, err));
         }
       }
     }
@@ -439,16 +628,17 @@ class TaskScheduler {
         for (const acc of accounts) {
           if (acc.features?.autoRedeem) {
             const client = this.getClient(acc);
-            client.getRewards().catch(() => {});
+            client.getRewards().catch(err => this.logTaskError('自动兑换商品刷新', acc.name, err));
           }
         }
       }
     } else if (targetTimes.includes(currentHm) && this.lastCompletedDate !== todayStr) {
       // 辅助规则未配置该项，按主时间点兜底 (兑换仍受自身策略日限制约，由完整流程内判定)
+      this.lastTriggerMinute = currentMinKey;
       for (const acc of accounts) {
         if (acc.features?.autoRedeem && acc.platform !== 'ydpc' && acc.platform !== 'ecloud') {
           const client = this.getClient(acc);
-          client.getRewards().catch(() => {});
+          client.getRewards().catch(err => this.logTaskError('自动兑换商品刷新', acc.name, err));
         }
       }
     }
@@ -477,6 +667,8 @@ class TaskScheduler {
     this.appendLog('Scheduler', `🔔 开始按序执行 ${accounts.length} 个云电脑的原生任务流程 (触发来源: ${reason})...`, 'info');
 
     const summaryResults = [];
+    const processedAccounts = [];
+    const failedAccounts = [];
 
     // 辅助防风控随机延时：步骤间 2~5 秒离散等待
     const sleepStepJitter = async (accName, stepName) => {
@@ -553,6 +745,8 @@ class TaskScheduler {
       // 若用户当前正在通过网页浏览器操控该云电脑，为避免互踢，自动跳过该账号的本次自动化，保持避让！
       if (client?.isWebUserActive) {
         this.appendLog('Scheduler', `[${acc.name}] 用户当前正在浏览器中远程操控云电脑，为避免会话冲突，本次自动化调度主动避让跳过，等用户关闭页面后再继续。`, 'info');
+        // 避让跳过也要纳入最终判定（按当前官方状态评估），不得从判定中消失
+        processedAccounts.push(acc);
         continue;
       }
 
@@ -672,6 +866,7 @@ class TaskScheduler {
                   let success = false;
                   let lastMsg = '';
                   let isRisk = false;
+                  let isUnknown = false;
 
                   // 报文属性构建
                   const orderAttrs = [];
@@ -696,51 +891,29 @@ class TaskScheduler {
                     }]
                   };
 
-                  for (let attempt = 1; attempt <= 3; attempt++) {
-                    try {
-                      if (attempt > 1) {
-                        this.appendLog('Redeem', `[${acc.name}] 正在进行第 ${attempt}/3 次自动重试...`, 'info');
-                        await new Promise(r => setTimeout(r, 3000));
+                  // 下单与重试策略收敛至 redeem_order.attemptRedeemOrder（缺陷修复 S11）：
+                  // 明确业务错误才有限重试；网络异常等结果不明确的情况绝不盲目重试，
+                  // 防止「服务端已受理但响应丢失」被重试成重复扣积分。
+                  const orderResult = await attemptRedeemOrder({
+                    fetchFn: (u, init) => fetch(u, init),
+                    url: 'https://desk.ctyun.cn/selforder/api/selforder/paas/placeOrder',
+                    headers: client.getSignedHeaders({ 'Content-Type': 'application/json;charset=UTF-8' }),
+                    payload,
+                    maxBusinessRetries: 3,
+                    onAttempt: (attempt, info) => {
+                      if (info.phase === 'retry') {
+                        this.appendLog('Redeem', `[${acc.name}] 正在进行第 ${attempt}/3 次自动重试（上次为明确业务失败）...`, 'info');
+                      } else if (info.phase === 'business_error') {
+                        this.appendLog('Redeem', `[${acc.name}] 第 ${attempt} 次自动兑换未成功: ${info.msg}`, 'warning');
                       }
-                      const res = await fetch('https://desk.ctyun.cn/selforder/api/selforder/paas/placeOrder', {
-                        method: 'POST',
-                        headers: client.getSignedHeaders({ 'Content-Type': 'application/json;charset=UTF-8' }),
-                        body: JSON.stringify(payload)
-                      });
-                      const data = await res.json();
-                      if (data.code === 0) {
-                        success = true;
-                        this.appendLog('Redeem', `[${acc.name}] ✅ 成功一次性完成【${rConf.prodName || rConf.prodId}】x${buyTimes} 自动兑换，共消耗 ${totalCost} 积分！`, 'success');
-                        break;
-                      }
-                      lastMsg = data.msg || `错误码 ${data.code}`;
-
-                      const isFatal = 
-                        lastMsg.includes('积分不足') || 
-                        lastMsg.includes('点数不足') || 
-                        lastMsg.includes('余额不足') ||
-                        lastMsg.includes('风控') || 
-                        lastMsg.includes('频繁') || 
-                        lastMsg.includes('异常操作') ||
-                        lastMsg.includes('超过最大') ||
-                        lastMsg.includes('上限');
-
-                      if (isFatal) {
-                        if (lastMsg.includes('风控') || lastMsg.includes('频繁') || lastMsg.includes('异常操作')) {
-                          isRisk = true;
-                        }
-                        this.appendLog('Redeem', `[${acc.name}] 自动下单触发限制 (${lastMsg})，终止重试。`, 'warning');
-                        break;
-                      }
-
-                      this.appendLog('Redeem', `[${acc.name}] 第 ${attempt} 次自动兑换未成功: ${lastMsg}`, 'warning');
-                    } catch (e) {
-                      lastMsg = e.message;
-                      this.appendLog('Redeem', `[${acc.name}] 第 ${attempt} 次网络异常: ${lastMsg}`, 'warning');
-                    }
-                  }
-
+                    },
+                  });
+                  success = orderResult.status === 'success';
+                  isRisk = orderResult.status === 'risk_blocked';
+                  isUnknown = orderResult.status === 'unknown';
+                  lastMsg = orderResult.msg;
                   if (success) {
+                    this.appendLog('Redeem', `[${acc.name}] ✅ 成功一次性完成【${rConf.prodName || rConf.prodId}】x${buyTimes} 自动兑换，共消耗 ${totalCost} 积分！`, 'success');
                     rConf.lastRedeemDate = todayStr;
                     acc.redeemConfig = rConf;
                     this.saveConfig();
@@ -751,8 +924,17 @@ class TaskScheduler {
                     );
                   } else if (isRisk) {
                     this.appendLog('Redeem', `[${acc.name}] 自动兑换触发风控已自动中止: ${lastMsg}`, 'error');
+                  } else if (isUnknown) {
+                    // 结果不明确：可能已受理。不写 lastRedeemDate（避免误记），也不再重试，
+                    // 明确通知人工核对天翼云订单/积分变动后再决定。
+                    this.appendLog('Redeem', `[${acc.name}] ⚠️ 自动兑换结果不明确（已停止重试以防重复下单）: ${lastMsg}。请人工核对订单与积分变动。`, 'error');
+                    this.sendNotification(
+                      acc,
+                      `⚠️ 天翼云自动兑换结果不明确 - ${acc.name}`,
+                      `账号【${acc.name}】兑换【${rConf.prodName || rConf.prodId}】时网络异常，服务端可能已受理。系统已停止自动重试以防重复扣积分，请人工核对订单记录与积分变动。`
+                    );
                   } else {
-                    this.appendLog('Redeem', `[${acc.name}] 自动兑换失败（已重试 3 次）: ${lastMsg}`, 'error');
+                    this.appendLog('Redeem', `[${acc.name}] 自动兑换失败: ${lastMsg}`, 'error');
                   }
                 }
               }
@@ -767,9 +949,12 @@ class TaskScheduler {
 
         await client.refreshOfficialTasks();
         summaryResults.push(accSummary);
+        processedAccounts.push(acc);
 
       } catch (err) {
         this.appendLog('Scheduler', `[${acc.name}] 任务执行链路异常: ${err.message}`, 'error');
+        // 链路异常的账号必须拉低最终判定，绝不能因未入 processedAccounts 而被默认放行
+        failedAccounts.push(acc);
       }
 
       // 账号间防风控离散随机退避 (仅在还有下一个账号时等待 5~15 秒)
@@ -780,54 +965,55 @@ class TaskScheduler {
       }
     }
 
-    // 严格判定：只有当所有账号已开启的全部任务（包括挂机满 1 小时）都真正达成时，才标记今日流程圆满完成
-    let allAccountsFullyDone = true;
-    for (const acc of accounts) {
-      const client = this.getClient(acc);
-      const tasks = client?.metrics?.officialTasks || [];
-      const loginTask = tasks.find(t => t.name.includes('登录AI云电脑'));
-      const aiTask = tasks.find(t => t.name.includes('AI对话'));
-      const hangTask = tasks.find(t => t.name.includes('使用1小时'));
+    // 严格判定（统一完成判定 evaluateAccountCompletion，与开机补跑同一事实来源 —— 新发现 S10）：
+    // 只有当所有已处理账号的全部已开启任务（含浏览器真挂机与自动兑换）都真正达成时，才标记今日圆满完成。
+    // 旧实现此处只查 sign/aiChat/cloudHang 三项，且通知明细按三项硬编码，与实际任务范围不一致。
+    const completionByAccount = processedAccounts.map(acc => ({
+      acc,
+      states: this.evaluateAccountCompletion(acc, this.getClient(acc), { todayStr }),
+    }));
+    const allAccountsFullyDone = failedAccounts.length === 0 && completionByAccount.length > 0 &&
+      completionByAccount.every(({ states }) => TaskScheduler.allStatesCompleted(states));
 
-      if (this.taskGate(acc, 'sign') && !(loginTask && (loginTask.status === 2 || loginTask.current >= loginTask.total))) {
-        allAccountsFullyDone = false;
+    const TASK_LABEL = { sign: '打卡', aiChat: 'AI对话', cloudHang: '挂机1小时', browserHang: '浏览器真挂机', redeem: '自动兑换' };
+    const STATUS_TEXT = {
+      [TASK_STATUS.COMPLETED]: '官方已确认达成',
+      [TASK_STATUS.PENDING]: '尚未达成',
+      [TASK_STATUS.UNKNOWN]: '状态未知（官方状态不可得）',
+      [TASK_STATUS.FAILED]: '本轮执行失败',
+      [TASK_STATUS.RUNNING]: '执行中',
+    };
+    const buildDetail = () => completionByAccount.map(({ acc, states }) => {
+      const parts = [];
+      for (const [key, label] of Object.entries(TASK_LABEL)) {
+        const st = states[key];
+        if (!st || st.status === TASK_STATUS.SKIPPED) continue;
+        // 兑换的 completed 是本地策略证据而非官方确认，措辞区分
+        const txt = key === 'redeem' && st.status === TASK_STATUS.COMPLETED ? '已完成' : (STATUS_TEXT[st.status] || st.status);
+        parts.push(`${label}[${txt}]`);
       }
-      if (this.taskGate(acc, 'aiChat') && !(aiTask && (aiTask.status === 2 || aiTask.current >= aiTask.total))) {
-        allAccountsFullyDone = false;
-      }
-      if (this.taskGate(acc, 'cloudHang') && !(hangTask && (hangTask.status === 2 || hangTask.current >= hangTask.total))) {
-        allAccountsFullyDone = false;
-      }
-    }
+      return `• ${acc.name}: ${parts.join(', ')}`;
+    }).join('\n');
 
     if (allAccountsFullyDone) {
       this.lastCompletedDate = todayStr;
       this.appendLog('Scheduler', `🎉 今日云电脑全部自动化任务已圆满达成！做完即标记今日达成，当天绝不再空转。`, 'success');
-      // 此处已通过 allAccountsFullyDone 的严格校验 (逐账号核对官方任务中心)，故可如实写"已达成"。
-      // 原实现是 `r.sign ? '已达成' : '已达成'` 这类两个分支完全相同的死代码，属虚报隐患 (新发现 #34)。
-      const detailText = summaryResults.map(r =>
-        `• ${r.name}: 打卡[已达成], AI对话[已达成], 挂机1小时[已满1小时]`
-      ).join('\n');
+      // 明细由统一完成判定按真实状态生成（全部为 completed 才进入此分支），不再硬编码。
       this.sendNotification(
         this.getSettings(),
         `🎉 天翼云电脑今日任务圆满达成 (${todayStr})`,
-        `今日自动化任务已全部达成：\n${detailText}\n所有任务均为原生协议极速直连，零 Chromium 内存占用！`
+        `今日自动化任务已全部达成：\n${buildDetail()}\n所有任务均为原生协议极速直连，零 Chromium 内存占用！`
       );
     } else {
-      const anySignPending = summaryResults.some(r => !r.sign);
-      const signStatusNote = anySignPending ? '打卡已认领、等待官方确认 (系统会自动复检)' : '打卡已完成';
+      const anySignPending = completionByAccount.some(({ states }) => states.sign && states.sign.status === TASK_STATUS.PENDING);
+      const anySignUnknown = completionByAccount.some(({ states }) => states.sign && states.sign.status === TASK_STATUS.UNKNOWN);
+      const signStatusNote = anySignUnknown ? '打卡状态未知 (官方状态刷新异常)' : (anySignPending ? '打卡已认领、等待官方确认 (系统会自动复检)' : '打卡已完成');
       this.appendLog('Scheduler', `⚡ 定时任务已执行 (${signStatusNote})。注意：打卡与挂机的最终成败一律以官方任务中心为准。`, 'info');
-      // 措辞一律不得暗示"已成功"：认领下发 ≠ 达成，挂机启动 ≠ 达成
-      const detailText = summaryResults.map(r => {
-        const signTxt = r.sign ? '官方已确认达成' : '认领已下发，待官方确认 (自动复检中)';
-        const aiTxt = r.aiChat ? '官方已确认达成' : '未确认，请刷新查看';
-        const hangTxt = r.hang ? '官方已确认达成' : '尚未达成，后台续跑中';
-        return `• ${r.name}: 打卡[${signTxt}], AI对话[${aiTxt}], 挂机1小时[${hangTxt}]`;
-      }).join('\n');
+      // 措辞一律不得暗示"已成功"：认领下发 ≠ 达成，挂机启动 ≠ 达成；明细与判定同源生成。
       this.sendNotification(
         this.getSettings(),
         `⚡ 天翼云电脑定时任务已触发 (${todayStr})`,
-        `定时任务已触发执行，长连接正在后台持续挂机中：\n${detailText}`
+        `定时任务已触发执行，长连接正在后台持续挂机中：\n${buildDetail()}`
       );
     }
 
@@ -837,4 +1023,4 @@ class TaskScheduler {
   }
 }
 
-module.exports = { TaskScheduler };
+module.exports = { TaskScheduler, validateCronExpression, shouldRunCron, TASK_STATUS };
