@@ -3803,6 +3803,16 @@ function rewardNeedsDesktop(prodId, prodType) {
     }
 
     await new Promise((resolve) => {
+      // 【复审第二轮】上游终结状态：任一落定路径（正常结束/出错/客户端断开/
+      // 上游超时）都先置位，避免 res close 回调对已正常结束的流重复销毁，
+      // 也避免断开后 promise 悬而不决。
+      let finished = false;
+      let proxyResRef = null;
+      const finish = () => { if (!finished) { finished = true; resolve(); } };
+      const destroyUpstream = () => {
+        try { proxyReq.destroy(); } catch (e) {}
+        try { if (proxyResRef) proxyResRef.destroy(); } catch (e) {}
+      };
       const proxyReq = https.request(parsedTarget, {
         method: req.method,
         headers: outgoingHeaders,
@@ -3817,10 +3827,11 @@ function rewardNeedsDesktop(prodId, prodType) {
           respHeaders[k] = v;
         }
         Object.assign(respHeaders, corsHeadersFor(req, { allowedOrigins: CORS_ALLOWED_ORIGINS }));
+        proxyResRef = proxyRes;
         res.writeHead(proxyRes.statusCode, respHeaders);
         proxyRes.pipe(res);
-        proxyRes.on('end', resolve);
-        proxyRes.on('error', () => resolve());
+        proxyRes.on('end', finish);
+        proxyRes.on('error', () => finish());
       });
 
       proxyReq.on('timeout', () => {
@@ -3833,10 +3844,17 @@ function rewardNeedsDesktop(prodId, prodType) {
         } else {
           try { res.end(); } catch (e) {}
         }
-        resolve();
+        finish();
       });
       // 客户端断开即终止上游请求（旧实现上游继续跑完并写已断开的 res）
-      req.on('aborted', () => { try { proxyReq.destroy(); } catch (e) {} resolve(); });
+      req.on('aborted', () => { destroyUpstream(); finish(); });
+      // 【复审第二轮】请求体已收完、响应流式传输中客户端才断开时，req
+      // aborted 不再触发（体已读完），此时靠 res close/error 兜底：响应未
+      // 正常结束即销毁上游请求与上游响应，避免上游继续占用连接跑满 30 秒
+      // 超时；正常结束的流 finished 已置位，不会误伤。
+      const onClientGone = () => { if (!finished) { destroyUpstream(); finish(); } };
+      res.on('close', onClientGone);
+      res.on('error', onClientGone);
 
       if (bodyBuffer.length > 0) {
         proxyReq.write(bodyBuffer);

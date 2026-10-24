@@ -164,3 +164,22 @@ test('redactUrlForLog: 各渠道 URL 中的令牌不出现在脱敏结果中', (
   assert.equal(redactUrlForLog(''), '(未配置)');
   assert.equal(redactUrlForLog(undefined), '(未配置)');
 });
+
+// ===== 复审第二轮：readAndParseBody 第三分支（无 body.getReader 又无 text()
+// 的非标准响应对象）此前只有超时、无字节上限 =====
+test('safeFetchJson: 第三分支超大 JSON 被体积 guard 拦下（默认 1MB）', async () => {
+  const big = { pad: 'x'.repeat(1024 * 1024 + 100) };
+  const fetchFn = async () => ({ status: 200, ok: true, headers: { get: () => null }, json: async () => big });
+  await assert.rejects(
+    safeFetchJson('https://hooks.example.com/x', { fetchFn, lookupFn: pub, timeoutMs: 5000 }),
+    /超过上限/
+  );
+});
+
+test('safeFetchJson: 第三分支自定义小上限同样生效', async () => {
+  const fetchFn = async () => ({ status: 200, ok: true, headers: { get: () => null }, json: async () => ({ pad: 'x'.repeat(2048) }) });
+  await assert.rejects(
+    safeFetchJson('https://hooks.example.com/x', { fetchFn, lookupFn: pub, timeoutMs: 5000, maxBodyBytes: 1024 }),
+    /超过上限/
+  );
+});

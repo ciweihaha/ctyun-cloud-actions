@@ -209,13 +209,25 @@ err.code = 'WEBHOOK_BODY_TOO_LARGE';
 throw err;
 }
 } else if (typeof res.json === 'function') {
+// 【复审第二轮】该分支此前只有超时保护、无字节上限：非标准响应对象
+// （无 body.getReader 又无 text()）返回的超大 JSON 会整段进内存。
+// 流式分支按累计字节拦截，此处只能事后序列化校验：序列化长度是线
+// 上字节的近似（不计空白差异），超限即硬失败，与另两分支口径一致；
+// 校验放在 try/catch 之外，避免超限错被降级为软 error 返回。
+let data;
 try {
-const data = await raceWithAbort(res.json(), signal, timeoutError);
-return { data, text: undefined, error: null };
+data = await raceWithAbort(res.json(), signal, timeoutError);
 } catch (e) {
 if (signal.aborted) throw timeoutError();
 return { data: undefined, text: undefined, error: e };
 }
+const serialized = JSON.stringify(data);
+if (serialized !== undefined && Buffer.byteLength(serialized, 'utf8') > maxBodyBytes) {
+const err = new Error(`Webhook 响应体超过上限（${maxBodyBytes} 字节）`);
+err.code = 'WEBHOOK_BODY_TOO_LARGE';
+throw err;
+}
+return { data, text: undefined, error: null };
 } else {
 text = '';
 }
