@@ -514,64 +514,9 @@ function generateDeviceCode() {
   return 'web_' + s;
 }
 
-// SSRF 防护：校验 URL 是否为安全的外部公共 HTTP/HTTPS 地址
-function isPrivateIpOrHost(hostname) {
-  const h = (hostname || '').toLowerCase().trim();
-  if (!h) return true;
-  if (h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '0.0.0.0') return true;
-  if (h.endsWith('.local') || h.endsWith('.internal') || h.endsWith('.lan')) return true;
-
-  if (net.isIPv4(h)) {
-    const parts = h.split('.').map(Number);
-    if (parts[0] === 127) return true; // 127.0.0.0/8 loopback
-    if (parts[0] === 10) return true;  // 10.0.0.0/8 private
-    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true; // 172.16.0.0/12 private
-    if (parts[0] === 192 && parts[1] === 168) return true; // 192.168.0.0/16 private
-    if (parts[0] === 169 && parts[1] === 254) return true; // 169.254.0.0/16 link-local / cloud metadata
-    if (parts[0] === 0) return true;   // 0.0.0.0/8 current network
-  }
-
-  if (net.isIPv6(h)) {
-    if (h === '::1' || h === '::') return true;
-    if (h.startsWith('fe80:')) return true; // link-local
-    if (h.startsWith('fc00:') || h.startsWith('fd00:')) return true; // ULA
-  }
-
-  return false;
-}
-
-function isValidWebhookTarget(channel, rawTarget) {
-  if (!rawTarget || typeof rawTarget !== 'string') return false;
-  const target = rawTarget.trim();
-  if (!target) return false;
-
-  const ch = channel || 'webhook';
-  // Token 型推送渠道 (向平台官方公共 API 发送请求)
-  if (ch === 'serverchan' || ch === 'pushplus') {
-    return /^[\w\-]{6,128}$/.test(target);
-  }
-  if (ch === 'telegram') {
-    // 格式 botToken@chatId
-    return /^[\w\-:]+@[\w\-]+$/.test(target);
-  }
-
-  // 钉钉支持输入纯 access_token (32~128位字符)
-  if (ch === 'dingtalk' && /^[a-zA-Z0-9_\-]{32,128}$/.test(target)) {
-    return true;
-  }
-
-  // URL 型推送渠道 (webhook, qywx, dingtalk, feishu, bark)
-  try {
-    // 剥离可能附带的 @SEC... 密钥后缀以供 URL 校验
-    const checkUrl = target.split('@SEC')[0].trim();
-    const u = new URL(checkUrl);
-    if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
-    if (isPrivateIpOrHost(u.hostname)) return false;
-    return true;
-  } catch (e) {
-    return false;
-  }
-}
+// SSRF 防护与 Webhook 安全发送已下沉 app/webhook_util（缺陷修复 G7）：
+// 在原字面校验基础上补 DNS 解析逐地址校验、重定向逐跳复检、超时与拒内嵌用户信息。
+const { isValidWebhookTarget, safeFetchJson } = require('./app/webhook_util');
 
 function isValidWebhookUrl(rawUrl) {
   return isValidWebhookTarget('webhook', rawUrl);
@@ -620,7 +565,7 @@ async function sendNotification(settings, title, content, extraVars = {}) {
 
   try {
     if (channel === 'webhook' && notify.webhookUrl) {
-      const res = await fetch(notify.webhookUrl, {
+      const res = await safeFetchJson(notify.webhookUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ title: finalTitle, content: finalContent, time: vars['{time}'] })
@@ -634,7 +579,7 @@ async function sendNotification(settings, title, content, extraVars = {}) {
           content: `### ${finalTitle}\n\n${finalContent}\n\n> 触发时间: ${vars['{time}']}`
         }
       };
-      const res = await fetch(notify.webhookUrl, {
+      const res = await safeFetchJson(notify.webhookUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(qywxPayload)
@@ -685,7 +630,7 @@ async function sendNotification(settings, title, content, extraVars = {}) {
           text: `### ${finalTitle}\n\n${finalContent}\n\n> 触发时间: ${vars['{time}']}`
         }
       };
-      const res = await fetch(dingUrl, {
+      const res = await safeFetchJson(dingUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(dingPayload)
@@ -744,7 +689,9 @@ async function sendNotification(settings, title, content, extraVars = {}) {
         feishuPayload.timestamp = timestamp;
         feishuPayload.sign = sign;
       }
-      const res = await fetch(notify.webhookUrl, {
+      // 【缺陷修复 G7】旧实现误用原始 notify.webhookUrl 发送（带 @secret 后缀的非法 URL，
+      // 且密钥随 URL 外泄）；钉钉分支用的是拆分后的 dingUrl，对照坐实此处必须用 feishuUrl。
+      const res = await safeFetchJson(feishuUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(feishuPayload)
@@ -754,14 +701,15 @@ async function sendNotification(settings, title, content, extraVars = {}) {
       return { success: isOk, message: feishuData.msg || feishuData.StatusMessage || `HTTP ${res.status}` };
     } else if (channel === 'serverchan' && notify.webhookUrl) {
       const url = `https://sctapi.ftqq.com/${notify.webhookUrl}.send`;
-      const res = await fetch(url, {
+      const res = await safeFetchJson(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: new URLSearchParams({ title: finalTitle, desp: finalContent }).toString()
       });
       return { success: res.ok, message: `HTTP ${res.status}` };
     } else if (channel === 'pushplus' && notify.webhookUrl) {
-      const res = await fetch('http://www.pushplus.plus/send', {
+      // 【缺陷修复 G7】官方接口支持 HTTPS，旧实现明文 http 发送 token，改走 https
+      const res = await safeFetchJson('https://www.pushplus.plus/send', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ token: notify.webhookUrl, title: finalTitle, content: finalContent })
@@ -769,12 +717,12 @@ async function sendNotification(settings, title, content, extraVars = {}) {
       return { success: res.ok, message: `HTTP ${res.status}` };
     } else if (channel === 'bark' && notify.webhookUrl) {
       const base = notify.webhookUrl.replace(/\/+$/, '');
-      const res = await fetch(`${base}/${encodeURIComponent(finalTitle)}/${encodeURIComponent(finalContent)}`);
+      const res = await safeFetchJson(`${base}/${encodeURIComponent(finalTitle)}/${encodeURIComponent(finalContent)}`, { method: 'GET' });
       return { success: res.ok, message: `HTTP ${res.status}` };
     } else if (channel === 'telegram' && notify.webhookUrl) {
       const [botToken, chatId] = notify.webhookUrl.split('@');
       if (botToken && chatId) {
-        const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+        const res = await safeFetchJson(`https://api.telegram.org/bot${botToken}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ chat_id: chatId, text: `*${finalTitle}*\n\n${finalContent}`, parse_mode: 'Markdown' })
