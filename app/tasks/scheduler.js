@@ -668,6 +668,7 @@ class TaskScheduler {
 
     const summaryResults = [];
     const processedAccounts = [];
+    const failedAccounts = [];
 
     // 辅助防风控随机延时：步骤间 2~5 秒离散等待
     const sleepStepJitter = async (accName, stepName) => {
@@ -744,6 +745,8 @@ class TaskScheduler {
       // 若用户当前正在通过网页浏览器操控该云电脑，为避免互踢，自动跳过该账号的本次自动化，保持避让！
       if (client?.isWebUserActive) {
         this.appendLog('Scheduler', `[${acc.name}] 用户当前正在浏览器中远程操控云电脑，为避免会话冲突，本次自动化调度主动避让跳过，等用户关闭页面后再继续。`, 'info');
+        // 避让跳过也要纳入最终判定（按当前官方状态评估），不得从判定中消失
+        processedAccounts.push(acc);
         continue;
       }
 
@@ -950,6 +953,8 @@ class TaskScheduler {
 
       } catch (err) {
         this.appendLog('Scheduler', `[${acc.name}] 任务执行链路异常: ${err.message}`, 'error');
+        // 链路异常的账号必须拉低最终判定，绝不能因未入 processedAccounts 而被默认放行
+        failedAccounts.push(acc);
       }
 
       // 账号间防风控离散随机退避 (仅在还有下一个账号时等待 5~15 秒)
@@ -967,7 +972,7 @@ class TaskScheduler {
       acc,
       states: this.evaluateAccountCompletion(acc, this.getClient(acc), { todayStr }),
     }));
-    const allAccountsFullyDone = completionByAccount.length > 0 &&
+    const allAccountsFullyDone = failedAccounts.length === 0 && completionByAccount.length > 0 &&
       completionByAccount.every(({ states }) => TaskScheduler.allStatesCompleted(states));
 
     const TASK_LABEL = { sign: '打卡', aiChat: 'AI对话', cloudHang: '挂机1小时', browserHang: '浏览器真挂机', redeem: '自动兑换' };

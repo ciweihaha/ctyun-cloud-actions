@@ -199,3 +199,31 @@ test('stop(): 清除开机补跑定时器句柄', () => {
   assert.equal(s.startupTimer, null);
   assert.equal(s.timer, null);
 });
+
+test('runAllAccounts: 账号链路异常时不得标记今日完成（回归：异常账号不得从判定中消失）', async () => {
+  const acc = accWithFeatures({});
+  const client = {
+    isWebUserActive: false,
+    wsAlive: true,
+    metrics: { officialTasks: [] },
+    refreshOfficialTasks: async () => { throw new Error('official api down'); },
+  };
+  const { s, notifications } = makeScheduler({ accounts: [acc], settings: baseSettings(), clients: { a1: client } });
+  await s.runAllAccounts('test');
+  assert.equal(s.lastCompletedDate, '');
+  assert.ok(notifications.every(n => !/圆满达成/.test(n.title)), '不得发送圆满达成通知');
+});
+
+test('runAllAccounts: 网页避让跳过的账号按官方状态纳入判定', async () => {
+  const acc = accWithFeatures({ autoSign: true, aiChat: true, cloudHang: true, browserHang: true, autoRedeem: false });
+  const client = {
+    isWebUserActive: true,
+    wsAlive: true,
+    metrics: { officialTasks: doneTasks() },
+    refreshOfficialTasks: async () => {},
+  };
+  const { s } = makeScheduler({ accounts: [acc], settings: baseSettings(), clients: { a1: client } });
+  await s.runAllAccounts('test');
+  const today = new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' });
+  assert.equal(s.lastCompletedDate, today, '官方已全达成的避让账号应判完成');
+});
