@@ -3350,12 +3350,13 @@ if (require.main === module) {
 // ==========================================================
 // HTTP 路由与 API 服务
 // ==========================================================
-function jsonResponse(res, data, statusCode = 200) {
+function jsonResponse(res, data, statusCode = 200, extraHeaders = {}) {
   const store = requestContext.getStore();
   const cors = store && store.req ? corsHeadersFor(store.req, { allowedOrigins: CORS_ALLOWED_ORIGINS }) : {};
   res.writeHead(statusCode, {
     'Content-Type': 'application/json; charset=utf-8',
-    ...cors
+    ...cors,
+    ...extraHeaders
   });
   res.end(JSON.stringify(data));
 }
@@ -3721,7 +3722,11 @@ function rewardNeedsDesktop(prodId, prodType) {
 
       res.writeHead(200, {
         'Content-Type': 'text/html; charset=utf-8',
-        'Cache-Control': 'no-store'
+        'Cache-Control': 'no-store',
+        // 【缺陷修复 G9】注入页含会话 token（URL）与云账号认证数据：
+        // 禁 Referer 外泄目标 URL、禁 MIME 嗅探
+        'Referrer-Policy': 'no-referrer',
+        'X-Content-Type-Options': 'nosniff'
       });
       res.end(html);
     } catch (err) {
@@ -5771,6 +5776,9 @@ function rewardNeedsDesktop(prodId, prodType) {
         timestamp: Date.now()
       };
 
+      // 【缺陷修复 G9】响应含明文密码与完整认证包：禁止任何缓存留存。
+      // 字段削减（password/secretKey 是否可删、token 能否移出 directViewUrl）依赖仓外
+      // 前端消费方式，无法在本仓隔离验证，列入修复报告人工决策，本轮不砍字段。
       jsonResponse(res, {
         success: true,
         user: acc.user,
@@ -5783,7 +5791,7 @@ function rewardNeedsDesktop(prodId, prodType) {
         desktopUrl: `https://pc.ctyun.cn/#/desktop-list`,
         desktopName: desktop.objName || desktop.desktopName || '云电脑',
         displayConfig: displayCfg
-      });
+      }, 200, { 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' });
     } catch (e) {
       jsonResponse(res, { error: e.message }, 500);
     }
@@ -6575,7 +6583,19 @@ function rewardNeedsDesktop(prodId, prodType) {
 
   // 21. 重启保活守护
   if (req.method === 'POST' && pathname === '/api/keeper/restart') {
-    appendLog('Keeper', '收到重启指令，正在重置所有保活周期...', 'warning');
+    // 【缺陷修复 G9】旧实现完全无鉴权：任何未登录者都能 POST 重置全部保活通道
+    // （断开所有账号长连接）。现要求管理员会话，并记审计日志（含操作者）。
+    const session = getSessionFromReq(req, parsedUrl);
+    if (!session) {
+      jsonResponse(res, { error: '未授权：请登录后再操作' }, 401);
+      return;
+    }
+    if (session.role !== 'admin') {
+      appendLog('Keeper', `非管理员 [${session.username}] 尝试重启保活守护，已拒绝`, 'warning');
+      jsonResponse(res, { error: '权限不足：仅管理员可重启保活守护' }, 403);
+      return;
+    }
+    appendLog('Keeper', `管理员 [${session.username}] 触发重启指令，正在重置所有保活周期...`, 'warning');
     for (const [id, client] of clientInstances.entries()) {
       client.stopKeepAliveWorker();
     }
