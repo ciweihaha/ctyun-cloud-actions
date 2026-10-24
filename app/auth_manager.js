@@ -40,6 +40,19 @@ function generateInitialAdminPassword() {
   return crypto.randomBytes(18).toString('base64url');
 }
 
+// 【缺陷修复 G4】统一密码策略：注册/自助改密/管理员重置共用一处校验。
+// 最小长度统一为 8（旧口径三处不一致：注册无校验、改密与重置均为 ≥5；
+// 与本用户 MoonTV 硬化时定的 ≥8 先例对齐。注意：策略只约束新设密码，
+// 存量用户登录不拦截，避免老用户被锁出）。
+const PASSWORD_MIN_LENGTH = 8;
+const PASSWORD_MAX_LENGTH = 128;
+function validatePasswordPolicy(password) {
+  if (typeof password !== 'string' || password.length === 0) return '密码不能为空';
+  if (password.length < PASSWORD_MIN_LENGTH) return `密码长度至少${PASSWORD_MIN_LENGTH}位`;
+  if (password.length > PASSWORD_MAX_LENGTH) return `密码长度不能超过${PASSWORD_MAX_LENGTH}位`;
+  return null;
+}
+
 class AuthManager {
   constructor(configManager) {
     this.configManager = configManager;
@@ -224,6 +237,11 @@ class AuthManager {
       return { success: false, error: '该用户名已被注册，请直接登录' };
     }
 
+    const policyError = validatePasswordPolicy(password);
+    if (policyError) {
+      return { success: false, error: policyError };
+    }
+
     const defaultQuota = cfg.settings?.defaultQuota || 2;
     const newUser = {
       id: 'u_' + crypto.randomUUID().substring(0, 8),
@@ -302,13 +320,50 @@ class AuthManager {
     return true;
   }
 
-  updateUserPassword(userId, newPassword) {
+  /** 吊销某用户全部会话（含落盘免登录会话），可保留一个 token（如自助改密的当前会话）。返回吊销数量。 */
+  revokeUserSessions(userId, { keepToken = null } = {}) {
+    let revoked = 0;
+    for (const [token, s] of this.sessions.entries()) {
+      if (s.userId === userId && token !== keepToken) {
+        this.sessions.delete(token);
+        revoked++;
+      }
+    }
+    if (revoked > 0) this._persistSessions();
+    return revoked;
+  }
+
+  verifyUserPassword(userId, password) {
+    const user = this.getUserById(userId);
+    if (!user) return false;
+    return verifyPassword(password, user.passwordHash);
+  }
+
+  updateUserPassword(userId, newPassword, opts = {}) {
     const cfg = this.configManager.config;
     const user = (cfg.users || []).find(u => u.id === userId);
     if (!user) return false;
+    if (validatePasswordPolicy(newPassword)) return false;
     user.passwordHash = hashPassword(newPassword);
+    // 【缺陷修复 G4】改密必须吊销旧会话（旧实现只改 hash，被盗会话在改密后仍有效 30 天）。
+    // 自助改密可通过 opts.keepToken 保留当前会话；管理员重置不保留任何会话。
+    this.revokeUserSessions(userId, { keepToken: opts.keepToken || null });
     this.configManager.saveConfig();
     return true;
+  }
+
+  /** 自助改密全流程（路由只做映射，逻辑可单测）：验当前密码 → 策略 → 改密并吊销其他会话。 */
+  changeOwnPassword(userId, currentPassword, newPassword, keepToken = null) {
+    const user = this.getUserById(userId);
+    if (!user) return { success: false, error: '用户不存在' };
+    if (!verifyPassword(currentPassword, user.passwordHash)) {
+      return { success: false, error: '当前密码不正确' };
+    }
+    const policyError = validatePasswordPolicy(newPassword);
+    if (policyError) return { success: false, error: policyError };
+    const ok = this.updateUserPassword(userId, newPassword, { keepToken });
+    if (!ok) return { success: false, error: '密码修改失败' };
+    return { success: true };
   }
 
   updateUserAvatar(userId, avatar) {
@@ -359,4 +414,4 @@ class AuthManager {
   }
 }
 
-module.exports = { AuthManager, hashPassword, verifyPassword };
+module.exports = { AuthManager, hashPassword, verifyPassword, validatePasswordPolicy, PASSWORD_MIN_LENGTH };

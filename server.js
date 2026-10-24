@@ -14,7 +14,8 @@ if (typeof dns.setDefaultResultOrder === 'function') {
 const WebSocket = require('ws');
 const CtYunEncryption = require('./app/ctyun_encryption');
 const { executeNativeAiChat, executeNativeSign, executeNativeHang } = require('./app/tasks/native_tasks');
-const { AuthManager } = require('./app/auth_manager');
+const { AuthManager, validatePasswordPolicy } = require('./app/auth_manager');
+const { LoginRateLimiter } = require('./app/login_rate_limit');
 const { TaskScheduler } = require('./app/tasks/scheduler');
 const { SohoClient } = require('./app/ydpc/soho_client');
 const { performCagAuthHold } = require('./app/ydpc/cag_client');
@@ -1098,6 +1099,8 @@ const authManager = new AuthManager({
   sessionStore: authSessionStore,
   dataDir: DATA_DIR // 【安全整改 2026-10-15】供 AuthManager 写随机初始口令文件（0600）
 });
+// 【缺陷修复 G4】登录失败限速：同 IP+用户名 10 分钟内失败 10 次拦截（旧实现无限速可撞库）
+const loginRateLimiter = new LoginRateLimiter();
 
 // ==========================================================
 // 开关语义的单一权威入口 (暗线 A 的结构性修复)
@@ -3937,12 +3940,21 @@ function rewardNeedsDesktop(prodId, prodType) {
   // 3. 用户系统 (登录、注册、修改个人密码、当前用户状态)
   if (req.method === 'POST' && pathname === '/api/auth/login') {
     const body = await parseJsonBody(req);
+    // 【缺陷修复 G4】登录限速：按连接 IP + 用户名计数（不采信可伪造的转发头）
+    const clientIp = req.socket?.remoteAddress || '';
+    if (loginRateLimiter.isBlocked(clientIp, body.username)) {
+      appendLog('Auth', `登录被限速拦截: IP=${clientIp} 用户=[${body.username}]`, 'warning');
+      jsonResponse(res, { success: false, error: '登录失败次数过多，请 10 分钟后再试' }, 429);
+      return;
+    }
     const remember = body.remember === true; // "30 天内免登录"勾选 ⇒ 会话落盘 + 前端持久存储
     const result = authManager.login(body.username, body.password, remember);
     if (result.success) {
+      loginRateLimiter.recordSuccess(clientIp, body.username);
       appendLog('Auth', `用户 [${body.username}] 登录成功${remember ? '（已勾选 30 天内免登录）' : ''}`, 'info');
       jsonResponse(res, result);
     } else {
+      loginRateLimiter.recordFailure(clientIp, body.username);
       jsonResponse(res, result, 400);
     }
     return;
@@ -3979,14 +3991,20 @@ function rewardNeedsDesktop(prodId, prodType) {
       return;
     }
     const body = await parseJsonBody(req);
-    const newPwd = (body.newPassword || '').trim();
-    if (!newPwd || newPwd.length < 5) {
-      jsonResponse(res, { error: '新密码长度至少5位' }, 400);
+    // 【缺陷修复 G4】旧实现不验当前密码且只要求 ≥5 位：拿到任一会话即可改密接管账号。
+    // 现走 AuthManager.changeOwnPassword：验当前密码 + 统一策略(≥8) + 吊销其他会话（保留当前）。
+    const result = authManager.changeOwnPassword(
+      session.userId,
+      typeof body.currentPassword === 'string' ? body.currentPassword : '',
+      (body.newPassword || '').trim(),
+      session.token
+    );
+    if (!result.success) {
+      jsonResponse(res, { error: result.error }, 400);
       return;
     }
-    authManager.updateUserPassword(session.userId, newPwd);
-    appendLog('Auth', `用户 [${session.username}] 修改了自己的登录密码`, 'info');
-    jsonResponse(res, { success: true, message: '密码修改成功' });
+    appendLog('Auth', `用户 [${session.username}] 修改了自己的登录密码（其他会话已吊销）`, 'info');
+    jsonResponse(res, { success: true, message: '密码修改成功，其他设备的登录已失效' });
     return;
   }
 
@@ -4100,14 +4118,16 @@ function rewardNeedsDesktop(prodId, prodType) {
       const userId = pathname.split('/')[4];
       const body = await parseJsonBody(req);
       const newPwd = (body.newPassword || '').trim();
-      if (!newPwd || newPwd.length < 5) {
-        jsonResponse(res, { error: '新密码长度至少5位' }, 400);
+      const policyError = validatePasswordPolicy(newPwd);
+      if (policyError) {
+        jsonResponse(res, { error: policyError }, 400);
         return;
       }
+      // updateUserPassword 内部会吊销该用户全部会话（管理员重置不保留任何会话）
       const ok = authManager.updateUserPassword(userId, newPwd);
       if (ok) {
-        appendLog('Admin', `管理员修改了用户 [${userId}] 的登录密码`, 'warning');
-        jsonResponse(res, { success: true, message: '用户密码已更新' });
+        appendLog('Admin', `管理员修改了用户 [${userId}] 的登录密码（该用户全部会话已吊销）`, 'warning');
+        jsonResponse(res, { success: true, message: '用户密码已更新，该用户需重新登录' });
       } else {
         jsonResponse(res, { error: '用户不存在' }, 404);
       }
