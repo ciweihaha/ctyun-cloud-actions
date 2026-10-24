@@ -8,8 +8,21 @@
 * - isValidWebhookTarget 不拒 URL 内嵌用户信息（user:pass@host）。
 * - 飞书分支用原始 notify.webhookUrl 发送（带 @secret 后缀）而非拆分后的
 * feishuUrl，与钉钉分支对照坐实为 bug（修复在 server.js sendNotification）。
-* 残余风险（如实记录）：校验-连接之间存在 TOCTOU 窗口，彻底封堵需连接时
-* IP 钉扎（自定义 agent 在 connect 阶段校验对端 IP），本轮未实施。
+* 本轮修复（fix/round3-ctyun-webhook-dns-pinning-20261024）：
+* 校验-连接 TOCTOU 已封堵：safeFetchJson 每一跳先经
+* resolvePublicAddresses 拿到预校验通过的公网地址集，再把该地址集以
+* pinnedIps 交给连接层；默认连接层 fetchWithPinnedIps 用 Node 内置
+* http/https + 自定义 lookup（createPinnedLookup）建连，连接时不再做
+* 任何系统 DNS 解析，实际连接的 IP 只能是 pinnedIps 中的地址。
+* 之所以不用第三方 undici 包做自定义 dispatcher：本仓运行依赖只有
+* ws，Node 24 的内置 fetch 所用的 undici 并不作为可 require 的公开
+* 模块提供（实测 require('undici') / require('node:undici') 均不存在），
+* 为此新引一个与运行时内置实现重复的 undici 依赖只会扩大供应链面；
+* 内置 http/https 的 lookup 钉扎达到同一保证（连接 IP ∈ 预校验集），
+* 且 TLS 栈仍是 Node 原生实现，见 fetchWithPinnedIps 的注释。
+* 残余风险（如实记录）：若校验时刻的 DNS 本身已被投毒、返回攻击者
+* 控制的公网 IP 且该 IP 持有与主机名匹配的有效证书，钉扎无法识别
+* ——那已超出 TOCTOU 范畴，属于 DNS/证书信任问题，不在本轮口径内。
 *
 * 本轮追加修复（fix/webhook-body-timeout-20261024）：
 * - 旧 safeFetchJson 在 fetch() 返回响应头后即 clearTimeout，调用方随后
@@ -21,6 +34,9 @@
 */
 const net = require('net');
 const dns = require('dns');
+const http = require('http');
+const https = require('https');
+const { Readable } = require('stream');
 const { URL} = require('url');
 
 function isPrivateIpOrHost(hostname) {
@@ -107,15 +123,18 @@ return '***';
 }
 
 /**
-* 解析主机名并逐个校验全部地址：任一地址为私有/保留即拒绝。
-* IP 字面量直接校验。lookupFn 可注入（单测）。
+* 解析主机名并逐个校验全部地址，返回预校验通过的公网地址集（去重保序）：
+* 任一地址为私有/保留即拒绝。IP 字面量直接校验并返回自身。
+* lookupFn 可注入（单测）。返回的地址集就是后续连接层唯一允许连接
+* 的钉扎集：调用方不得在连接时重新解析，必须原样传给连接层。
+* 报错文案与旧 assertHostPublic 保持一致（既有测试按文案匹配）。
 */
-async function assertHostPublic(hostname, lookupFn = defaultLookup) {
+async function resolvePublicAddresses(hostname, lookupFn = defaultLookup) {
 const h = (hostname || '').toLowerCase().trim();
 if (isPrivateIpOrHost(h)) {
 throw new Error(`Webhook 目标主机不允许: ${hostname}`);
 }
-if (net.isIP(h)) return; // 公网 IP 字面量已由 isPrivateIpOrHost 排除私有段
+if (net.isIP(h)) return [h]; // 公网 IP 字面量已由 isPrivateIpOrHost 排除私有段
 let addresses;
 try {
 addresses = await lookupFn(h);
@@ -125,12 +144,210 @@ throw new Error(`Webhook 目标域名解析失败: ${hostname}`);
 if (!addresses || addresses.length === 0) {
 throw new Error(`Webhook 目标域名无解析结果: ${hostname}`);
 }
+const out = [];
 for (const a of addresses) {
 const ip = typeof a === 'string'? a: a.address;
 if (isPrivateIpOrHost(ip)) {
 throw new Error(`Webhook 目标解析到私有地址: ${hostname} -> ${ip}`);
 }
+if (ip && !out.includes(ip)) out.push(ip);
 }
+return out;
+}
+
+/**
+* 解析主机名并逐个校验全部地址：任一地址为私有/保留即拒绝。
+* 兼容旧接口：只做校验不返回值，需要钉扎集请用 resolvePublicAddresses。
+*/
+async function assertHostPublic(hostname, lookupFn = defaultLookup) {
+await resolvePublicAddresses(hostname, lookupFn);
+}
+
+/**
+* 由钉扎地址集构造 dns.lookup 兼容函数：连接时只返回钉扎地址，
+* 绝不调用系统 DNS，也绝不接受调用方传入的任何解析结果。
+* 签名兼容 net.connect 的 lookup 选项：(hostname, options, callback)，
+* options 可为 family 数字或 { all, family }；all:true 时返回全部钉扎
+* 地址，否则返回首个钉扎地址。family 仅作参考：返回地址的 family 以
+* 地址本身为准，避免因 family 不匹配而被迫换到非钉扎地址。
+*/
+function createPinnedLookup(pinnedIps) {
+const ips = (pinnedIps || []).filter(Boolean);
+return (hostname, options, callback) => {
+if (typeof options === 'function') {
+callback = options;
+options = {};
+}
+const all = !!(options && typeof options === 'object' && options.all);
+const done = () => {
+if (all) {
+callback(null, ips.map((address) => ({ address, family: net.isIP(address) })));
+} else if (ips.length > 0) {
+callback(null, ips[0], net.isIP(ips[0]));
+} else {
+const err = new Error(`Webhook 钉扎地址集为空: ${hostname}`);
+err.code = 'ENOTFOUND';
+callback(err);
+}
+};
+// lookup 回调按 Node 约定异步触发，避免同步回调打乱 net 内部状态机。
+if (typeof process !== 'undefined' && typeof process.nextTick === 'function') process.nextTick(done);
+else setTimeout(done, 0);
+};
+}
+
+const PINNED_RETRYABLE_CODES = new Set(['ECONNREFUSED', 'ENETUNREACH', 'EHOSTUNREACH']);
+function isTlsError(err) {
+if (!err) return false;
+if (typeof err.code === 'string' && (err.code.startsWith('CERT') || err.code.startsWith('ERR_TLS'))) return true;
+return /certificate|TLS|SSL/i.test(err.message || '');
+}
+
+/**
+* 以钉扎地址集建连的 fetch 等价实现（Node 内置 http/https，无新依赖）：
+* - 连接 IP 唯一来源是 pinnedIps：通过 lookup 选项把主机名的解析结果
+*   固定为钉扎集，建连全程不再查询系统 DNS，校验后重绑定无效。
+* - TLS 绝不绕过：https 请求显式 servername=原始主机名（IP 字面量时
+*   不设 servername，由 Node 按 IP SAN 校验），rejectUnauthorized 恒为
+*   true，不改写 checkServerIdentity；ca 仅在调用方显式传入时转发
+*   （生产调用方不传，即系统 CA；测试用自签证书时才传）。
+* - agent:false：每个请求不用连接池复用，避免池中旧连接（可能对应
+*   另一跳/另一地址集）被复用到本跳。
+* - 多地址回落只限“建连前即被拒”的错误（ECONNREFUSED/ENETUNREACH/
+*   EHOSTUNREACH：对端根本未接受连接，不存在已处理请求被重复发送
+*   的风险）；TLS/证书错误一律硬失败不回落，避免用回落掩盖证书错配；
+*   其余错误（包括已建连后中断）同样不回落，避免 POST 重复投递。
+* - 公网性纵深防御：pinnedIps 中任一私网/保留地址且未显式
+*   allowPrivatePinnedIps 时直接拒绝。生产入口 safeFetchJson 只传
+*   预校验通过的公网集，本分支对其无影响；allowPrivate 仅供本地
+*   回环测试（假主机名 + 127.0.0.1 本地服务器）显式 opt-in，生产
+*   代码路径绝不设置它。
+* 返回值与 Response 同形子集（status/ok/headers.get/body/text()/json()），
+* body 为 Web ReadableStream（可由 safeFetchJson 的流式读体分支消费，
+* 单次消费，与 Response 语义一致）；signal 中止时销毁请求与响应。
+*/
+async function fetchWithPinnedIps(urlString, {
+method = 'GET',
+headers = {},
+body,
+signal,
+pinnedIps,
+allowPrivatePinnedIps = false,
+ca,
+} = {}) {
+let u;
+try {
+u = new URL(urlString);
+} catch (e) {
+throw new Error(`Webhook URL 非法: ${redactUrlForLog(urlString)}`);
+}
+if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+throw new Error(`Webhook 协议不允许: ${u.protocol}`);
+}
+if (u.username || u.password) {
+throw new Error('Webhook URL 不得内嵌用户信息');
+}
+if (!pinnedIps || pinnedIps.length === 0) {
+throw new Error('Webhook 钉扎地址集为空，拒绝建连');
+}
+if (!allowPrivatePinnedIps) {
+for (const ip of pinnedIps) {
+if (isPrivateIpOrHost(ip)) throw new Error(`Webhook 钉扎地址为私有/保留地址，拒绝建连: ${ip}`);
+}
+}
+const isHttps = u.protocol === 'https:';
+const port = u.port ? Number(u.port) : (isHttps ? 443 : 80);
+const isIpLiteral = !!net.isIP(u.hostname);
+let lastError = null;
+for (let i = 0; i < pinnedIps.length; i++) {
+const ip = pinnedIps[i];
+try {
+return await new Promise((resolve, reject) => {
+if (signal && signal.aborted) {
+const err = new Error('The operation was aborted');
+err.name = 'AbortError';
+reject(err);
+return;
+}
+const requestOptions = {
+host: u.hostname,
+port,
+path: `${u.pathname}${u.search}`,
+method,
+headers: { ...headers },
+lookup: createPinnedLookup([ip]),
+agent: false,
+signal,
+};
+if (isHttps) {
+requestOptions.rejectUnauthorized = true;
+if (!isIpLiteral) requestOptions.servername = u.hostname;
+if (ca !== undefined) requestOptions.ca = ca;
+}
+const requestFn = isHttps ? https.request : http.request;
+let req;
+let resRef = null;
+try {
+req = requestFn(requestOptions, (res) => {
+resRef = res;
+const webBody = Readable.toWeb(res);
+let consumed = false;
+const readAll = async () => {
+if (consumed) throw new Error('Webhook 响应体已被消费');
+consumed = true;
+const reader = webBody.getReader();
+const chunks = [];
+for (;;) {
+const { done, value } = await reader.read();
+if (done) break;
+if (value) chunks.push(Buffer.from(value));
+}
+return Buffer.concat(chunks).toString('utf8');
+};
+resolve({
+status: res.statusCode,
+ok: res.statusCode >= 200 && res.statusCode < 300,
+headers: {
+get: (name) => {
+const v = res.headers[String(name).toLowerCase()];
+if (Array.isArray(v)) return v[0] !== undefined ? v[0] : null;
+return v !== undefined ? v : null;
+},
+raw: res.headers,
+},
+body: webBody,
+text: readAll,
+json: async () => JSON.parse(await readAll()),
+});
+});
+} catch (e) {
+reject(e);
+return;
+}
+const onAbort = () => {
+try { req.destroy(new Error('The operation was aborted')); } catch (e) {}
+try { if (resRef) resRef.destroy(); } catch (e) {}
+};
+if (signal) signal.addEventListener('abort', onAbort, { once: true });
+req.on('error', (err) => {
+if (signal) signal.removeEventListener('abort', onAbort);
+reject(err);
+});
+req.on('close', () => {
+if (signal) signal.removeEventListener('abort', onAbort);
+});
+if (body !== undefined && body !== null) req.write(body);
+req.end();
+});
+} catch (e) {
+lastError = e;
+if (signal && signal.aborted) throw e;
+if (isTlsError(e)) throw e;
+if (i < pinnedIps.length - 1 && e && PINNED_RETRYABLE_CODES.has(e.code)) continue;
+throw e;
+}
+}
+throw lastError || new Error('Webhook 钉扎建连失败');
 }
 
 /**
@@ -248,13 +465,18 @@ return { data: undefined, text, error: e };
 * 函数内部读完 body 后才返回，返回值是与 Response 同形的对象
 * （status/ok/headers/json()/text()），json() 直接给出已解析结果，
 * 调用方不得、也不需要再对真实网络响应做二次读取。
-* fetchFn/lookupFn 可注入（单测用本地模拟服务）。
+* 【DNS 钉扎语义】每一跳只解析一次（resolvePublicAddresses），解析
+* 结果 pinnedIps 原样交给连接层；默认连接层即 fetchWithPinnedIps，
+* 连接时不再解析，校验后重绑定无效。fetchFn/lookupFn 可注入（单测
+* 用本地模拟服务）：注入 fetchFn 时同样收到 pinnedIps，测试可断言
+* 连接器拿到的是校验时地址集而非重绑定后地址；生产调用方不传
+* fetchFn，走默认钉扎连接层。
 */
 async function safeFetchJson(urlString, {
 method = 'POST',
 headers = {},
 body,
-fetchFn = fetch,
+fetchFn,
 lookupFn = defaultLookup,
 timeoutMs = 10000,
 maxRedirects = 3,
@@ -278,14 +500,16 @@ throw new Error(`Webhook 协议不允许: ${u.protocol}`);
 if (u.username || u.password) {
 throw new Error('Webhook URL 不得内嵌用户信息');
 }
-await raceWithAbort(assertHostPublic(u.hostname, lookupFn), controller.signal, timeoutError);
+const pinnedIps = await raceWithAbort(resolvePublicAddresses(u.hostname, lookupFn), controller.signal, timeoutError);
+const transport = fetchFn || fetchWithPinnedIps;
 
-const res = await raceWithAbort(fetchFn(u.toString(), {
+const res = await raceWithAbort(transport(u.toString(), {
 method,
 headers,
 body,
 redirect: 'manual',
 signal: controller.signal,
+pinnedIps,
 }), controller.signal, timeoutError);
 
 const isRedirect = res.status >= 300 && res.status < 400;
@@ -326,6 +550,9 @@ module.exports = {
 isPrivateIpOrHost,
 isValidWebhookTarget,
 assertHostPublic,
+resolvePublicAddresses,
+createPinnedLookup,
+fetchWithPinnedIps,
 safeFetchJson,
 redactUrlForLog,
 };
