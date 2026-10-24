@@ -16,6 +16,17 @@ const CtYunEncryption = require('./app/ctyun_encryption');
 const { executeNativeAiChat, executeNativeSign, executeNativeHang } = require('./app/tasks/native_tasks');
 const { AuthManager, validatePasswordPolicy } = require('./app/auth_manager');
 const { LoginRateLimiter } = require('./app/login_rate_limit');
+const { AsyncLocalStorage } = require('async_hooks');
+const {
+  parseJsonBody: parseJsonBodyImpl,
+  corsHeadersFor,
+  parseAllowedOrigins,
+  createExceptionGuard,
+} = require('./app/http_util');
+// 【缺陷修复 G5】请求级上下文：供 jsonResponse 等无 req 参数的助手取当前请求的 CORS 判定
+const requestContext = new AsyncLocalStorage();
+// 【缺陷修复 G5】CORS 仅同源或 CTYUN_CORS_ORIGINS 名单（逗号分隔）放行，替代全站 '*'
+const CORS_ALLOWED_ORIGINS = parseAllowedOrigins(process.env.CTYUN_CORS_ORIGINS);
 const { TaskScheduler } = require('./app/tasks/scheduler');
 const { SohoClient } = require('./app/ydpc/soho_client');
 const { performCagAuthHold } = require('./app/ydpc/cag_client');
@@ -31,9 +42,21 @@ const { LogPersister } = require('./app/persist_log');
 //   ① 异常/拒绝除 console.error 外**同时落持久日志**（stderr 可能丢失，jsonl 一定在）；
 //   ② 'exit' 钩子记录退出码（进程自杀/正常退出均可见）；
 //   ③ SIGINT/SIGTERM 记录并优雅退出（被要求停止时也留证）。
+// 【缺陷修复 G5】未捕获异常熔断：旧实现无限吞异常常驻，进程可带病长期运行。
+// 窗口（默认 10 分钟）内累计达阈值（默认 5，env CTYUN_FATAL_EXCEPTION_THRESHOLD 可调）
+// 判定进程不健康：落盘堆栈 → 停调度 → exit(1)，交给守护进程/Docker 重启策略拉起干净进程。
+const exceptionGuard = createExceptionGuard({
+  threshold: Math.max(1, parseInt(process.env.CTYUN_FATAL_EXCEPTION_THRESHOLD || '5', 10) || 5),
+  onFatal: (err, count) => {
+    try { appendLog('System', `❌ 未捕获异常窗口内累计 ${count} 次，判定进程不健康，主动退出待守护重启。最后异常: ${(err && err.stack) || err}`, 'error'); } catch (e) {}
+    try { if (typeof taskScheduler !== 'undefined' && taskScheduler) taskScheduler.stop(); } catch (e) {}
+    process.exit(1);
+  },
+});
 process.on('uncaughtException', (err) => {
   console.error('[!] 系统未捕获异常已拦截 (常驻保障):', err?.message || err);
   try { appendLog('System', `⚠️ 未捕获异常已拦截（进程继续运行）: ${(err && err.message) || err}`, 'error'); } catch (e) { /* 日志不可用则仅 console */ }
+  exceptionGuard.record(err);
 });
 process.on('unhandledRejection', (reason) => {
   console.error('[!] 系统未处理 Promise 拒绝已拦截:', reason?.message || reason);
@@ -3369,11 +3392,11 @@ if (require.main === module) {
 // HTTP 路由与 API 服务
 // ==========================================================
 function jsonResponse(res, data, statusCode = 200) {
+  const store = requestContext.getStore();
+  const cors = store && store.req ? corsHeadersFor(store.req, { allowedOrigins: CORS_ALLOWED_ORIGINS }) : {};
   res.writeHead(statusCode, {
     'Content-Type': 'application/json; charset=utf-8',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS'
+    ...cors
   });
   res.end(JSON.stringify(data));
 }
@@ -3404,18 +3427,10 @@ function serveStatic(res, filePath, contentType) {
   });
 }
 
-function parseJsonBody(req) {
-  return new Promise((resolve) => {
-    let body = '';
-    req.on('data', chunk => { body += chunk; });
-    req.on('end', () => {
-      try {
-        resolve(JSON.parse(body || '{}'));
-      } catch (e) {
-        resolve({});
-      }
-    });
-  });
+function parseJsonBody(req, opts) {
+  // 【缺陷修复 G5】实现下沉 app/http_util：字节上限(默认1MB)/413/400/aborted 必 settle。
+  // 旧实现字符串无上限累积 + 解析失败吞错返回 {} + 断开永不 settle。
+  return parseJsonBodyImpl(req, opts);
 }
 
 function getSessionFromReq(req, parsedUrl = null) {
@@ -3462,12 +3477,12 @@ async function getCtyunIndexHtml() {
   return cachedCtyunIndexHtml || '<!doctype html><html><head><title>天翼量子AI云电脑</title></head><body><div id="app"></div></body></html>';
 }
 
-async function proxyStaticAsset(res, targetUrl) {
+async function proxyStaticAsset(req, res, targetUrl) {
   if (ctyunStaticCache.has(targetUrl)) {
     const cached = ctyunStaticCache.get(targetUrl);
     res.writeHead(200, {
       'Content-Type': cached.contentType,
-      'Access-Control-Allow-Origin': '*',
+      ...(req ? corsHeadersFor(req, { allowedOrigins: CORS_ALLOWED_ORIGINS }) : {}),
       'Cache-Control': 'public, max-age=86400'
     });
     res.end(cached.buffer);
@@ -3501,7 +3516,7 @@ async function proxyStaticAsset(res, targetUrl) {
 
     res.writeHead(200, {
       'Content-Type': contentType,
-      'Access-Control-Allow-Origin': '*',
+      ...(req ? corsHeadersFor(req, { allowedOrigins: CORS_ALLOWED_ORIGINS }) : {}),
       'Cache-Control': 'public, max-age=86400'
     });
     res.end(buffer);
@@ -3511,15 +3526,32 @@ async function proxyStaticAsset(res, targetUrl) {
   }
 }
 
-const server = http.createServer(async (req, res) => {
+const server = http.createServer((req, res) => {
+  requestContext.run({ req }, () => {
+    handleHttpRequest(req, res).catch((err) => {
+      // 【缺陷修复 G5】主 handler 外层兜底（旧实现 async handler 抛错即 unhandledRejection，
+      // 请求挂死无响应）：按 err.statusCode 映射（413/400 等），其余 500，错误只记 message。
+      const status = err && err.statusCode ? err.statusCode : 500;
+      try { appendLog('System', `请求处理异常 (${req.method} ${String(req.url || '').slice(0, 120)}): ${(err && err.message) || err}`, 'error'); } catch (e) {}
+      if (!res.headersSent) {
+        try { jsonResponse(res, { error: status === 500 ? '服务器内部错误' : err.message }, status); } catch (e) {}
+      } else {
+        try { res.end(); } catch (e) {}
+      }
+    });
+  });
+});
+// 【缺陷修复 G5】慢速/半开连接超时（旧实现未配置，slow-loris 可长期占用连接）
+server.requestTimeout = 120000;
+server.headersTimeout = 30000;
+
+async function handleHttpRequest(req, res) {
   const parsedUrl = new URL(req.url, `http://${req.headers.host}`);
   const pathname = parsedUrl.pathname;
 
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Headers': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS'
+      ...corsHeadersFor(req, { allowedOrigins: CORS_ALLOWED_ORIGINS })
     });
     res.end();
     return;
@@ -3741,7 +3773,7 @@ function rewardNeedsDesktop(prodId, prodType) {
   if (pathname.startsWith('/workers/') || pathname.includes('bbenc.worker.js')) {
     const filename = pathname.split('/').pop() || 'bbenc.worker.js';
     const targetUrl = 'https://pc.ctyun.cn/workers/' + filename;
-    await proxyStaticAsset(res, targetUrl);
+    await proxyStaticAsset(req, res, targetUrl);
     return;
   }
 
@@ -3749,7 +3781,7 @@ function rewardNeedsDesktop(prodId, prodType) {
   if (pathname.includes('bbEncDecoder') || pathname.endsWith('.wasm')) {
     const filename = pathname.split('/').pop();
     const targetUrl = 'https://pc.ctyun.cn/static/common/' + filename;
-    await proxyStaticAsset(res, targetUrl);
+    await proxyStaticAsset(req, res, targetUrl);
     return;
   }
 
@@ -3757,7 +3789,7 @@ function rewardNeedsDesktop(prodId, prodType) {
   if (pathname.startsWith('/ctyun-static/')) {
     const relPath = pathname.substring(13).replace(/^\/+/, '');
     const targetUrl = 'https://pc.ctyun.cn/' + relPath;
-    await proxyStaticAsset(res, targetUrl);
+    await proxyStaticAsset(req, res, targetUrl);
     return;
   }
 
@@ -3854,7 +3886,7 @@ function rewardNeedsDesktop(prodId, prodType) {
       serveStatic(res, file, type);
     } else {
       const targetUrl = 'https://pc.ctyun.cn' + pathname;
-      await proxyStaticAsset(res, targetUrl);
+      await proxyStaticAsset(req, res, targetUrl);
     }
     return;
   }
@@ -3908,7 +3940,7 @@ function rewardNeedsDesktop(prodId, prodType) {
       'Cache-Control': 'no-cache, no-transform',
       'Connection': 'keep-alive',
       'X-Accel-Buffering': 'no',
-      'Access-Control-Allow-Origin': '*'
+      ...corsHeadersFor(req, { allowedOrigins: CORS_ALLOWED_ORIGINS })
     });
     // 立即下发初始心跳
     res.write(': connected\n\n');
@@ -6379,7 +6411,7 @@ function rewardNeedsDesktop(prodId, prodType) {
     res.writeHead(200, {
       'Content-Type': 'application/json; charset=utf-8',
       'Content-Disposition': `attachment; filename="ctyun_config_backup_${Date.now()}.json"`,
-      'Access-Control-Allow-Origin': '*'
+      ...corsHeadersFor(req, { allowedOrigins: CORS_ALLOWED_ORIGINS })
     });
     res.end(JSON.stringify(exportData, null, 2));
     return;
@@ -6393,7 +6425,8 @@ function rewardNeedsDesktop(prodId, prodType) {
       return;
     }
 
-    const body = await parseJsonBody(req);
+    // 配置备份文件体积可大于普通 API 请求，导入路由显式放宽到 10MB（仍有上限，不再无界）
+    const body = await parseJsonBody(req, { maxBytes: 10 * 1024 * 1024 });
     const importAccounts = Array.isArray(body.accounts) ? body.accounts : [];
     if (importAccounts.length === 0) {
       jsonResponse(res, { error: '导入失败：未在 JSON 文件中解析到合法的 accounts 数组' }, 400);
@@ -6581,7 +6614,7 @@ function rewardNeedsDesktop(prodId, prodType) {
   }
 
   jsonResponse(res, { error: 'Not Found' }, 404);
-});
+}
 
 if (require.main === module) {
   // 【安全整改 2026-10-15】默认只监听本地回环，裸机部署不再把仪表盘暴露到局域网/公网。
