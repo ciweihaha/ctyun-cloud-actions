@@ -1,5 +1,6 @@
 const { executeNativeAiChat, executeNativeSign, executeNativeHang } = require('./native_tasks');
-const { executeBrowserHang } = require('./browser_hang');
+const browserHangModule = require('./browser_hang');
+const { executeBrowserHang } = browserHangModule;
 const { attemptRedeemOrder } = require('./redeem_order');
 
 function getBeijingDate() {
@@ -221,6 +222,8 @@ class TaskScheduler {
       clearTimeout(this.startupTimer);
       this.startupTimer = null;
     }
+    // 停止时取消在跑的浏览器真挂机（只终止其自有子进程），避免孤儿浏览器残留
+    try { browserHangModule.cancelAllBrowserHangs?.(); } catch (e) {}
   }
 
   /** 分项任务失败的统一脱敏日志（旧实现多处 .catch(()=>{}) 静默吞错，排障无据）。只记错误 message，不记任何凭据/报文。 */
