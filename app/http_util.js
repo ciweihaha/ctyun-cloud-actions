@@ -57,6 +57,30 @@ function parseJsonBody(req, { maxBytes = DEFAULT_JSON_MAX_BYTES } = {}) {
   });
 }
 
+/** 读取原始请求体 Buffer（代理转发用）：字节上限 + 超限 413 + 断开必 settle。 */
+function readRawBody(req, { maxBytes = 10 * 1024 * 1024 } = {}) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const fail = (err) => { if (!settled) { settled = true; reject(err); } };
+    const declared = Number(req.headers && req.headers['content-length']);
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      fail(httpError(413, '请求体过大'));
+      return;
+    }
+    const chunks = [];
+    let total = 0;
+    req.on('data', (chunk) => {
+      if (settled) return;
+      total += chunk.length;
+      if (total > maxBytes) { fail(httpError(413, '请求体过大')); return; }
+      chunks.push(chunk);
+    });
+    req.on('end', () => { if (!settled) { settled = true; resolve(Buffer.concat(chunks)); } });
+    req.on('aborted', () => fail(httpError(400, '请求已中断')));
+    req.on('error', (err) => fail(err && err.statusCode ? err : httpError(400, '请求读取失败')));
+  });
+}
+
 function parseAllowedOrigins(envValue) {
   return String(envValue || '').split(',').map(s => s.trim()).filter(Boolean);
 }
@@ -111,6 +135,7 @@ function createExceptionGuard({ threshold = 5, windowMs = 10 * 60 * 1000, nowFn 
 
 module.exports = {
   parseJsonBody,
+  readRawBody,
   corsHeadersFor,
   parseAllowedOrigins,
   createExceptionGuard,

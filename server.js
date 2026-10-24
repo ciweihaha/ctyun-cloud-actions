@@ -19,10 +19,17 @@ const { LoginRateLimiter } = require('./app/login_rate_limit');
 const { AsyncLocalStorage } = require('async_hooks');
 const {
   parseJsonBody: parseJsonBodyImpl,
+  readRawBody,
   corsHeadersFor,
   parseAllowedOrigins,
   createExceptionGuard,
 } = require('./app/http_util');
+const {
+  validateProxyTarget,
+  buildProxyHeaders,
+  PROXY_BODY_MAX_BYTES,
+  PROXY_UPSTREAM_TIMEOUT_MS,
+} = require('./app/proxy_util');
 // 【缺陷修复 G5】请求级上下文：供 jsonResponse 等无 req 参数的助手取当前请求的 CORS 判定
 const requestContext = new AsyncLocalStorage();
 // 【缺陷修复 G5】CORS 仅同源或 CTYUN_CORS_ORIGINS 名单（逗号分隔）放行，替代全站 '*'
@@ -3532,7 +3539,7 @@ const server = http.createServer((req, res) => {
       // 【缺陷修复 G5】主 handler 外层兜底（旧实现 async handler 抛错即 unhandledRejection，
       // 请求挂死无响应）：按 err.statusCode 映射（413/400 等），其余 500，错误只记 message。
       const status = err && err.statusCode ? err.statusCode : 500;
-      try { appendLog('System', `请求处理异常 (${req.method} ${String(req.url || '').slice(0, 120)}): ${(err && err.message) || err}`, 'error'); } catch (e) {}
+      try { appendLog('System', `请求处理异常 (${req.method} ${String(req.url || '').slice(0, 120).replace(/([?&]token=)[^&]+/gi, '$1***')}): ${(err && err.message) || err}`, 'error'); } catch (e) {}
       if (!res.headersSent) {
         try { jsonResponse(res, { error: status === 500 ? '服务器内部错误' : err.message }, status); } catch (e) {}
       } else {
@@ -3655,12 +3662,15 @@ function rewardNeedsDesktop(prodId, prodType) {
   }
 
   // 2. API 请求代理拦截器 (规避跨域与 Origin 防盗链)
+  // 【缺陷修复 G6】代理路由已要求仪表盘会话鉴权：重写 URL 时附带当前会话 token
+  // （token 只发往本机代理，代理仅取 target 转发，上游永远看不到该参数）。
   const proxyBase = '/api/ctyun-proxy?target=';
+  const proxyToken = ${JSON.stringify(session.token || '')};
   function rewriteUrl(u) {
     if (!u || typeof u !== 'string') return u;
     if (u.startsWith(proxyBase)) return u;
     if (u.includes('.ctyun.cn:8810') || u.includes('.ctyun.cn:8816') || u.includes('-deskmgr.ctyun.cn')) {
-      return proxyBase + encodeURIComponent(u);
+      return proxyBase + encodeURIComponent(u) + '&token=' + encodeURIComponent(proxyToken);
     }
     return u;
   }
@@ -3797,11 +3807,17 @@ function rewardNeedsDesktop(prodId, prodType) {
   if (pathname === '/api/ctyun-proxy') {
     if (req.method === 'OPTIONS') {
       res.writeHead(204, {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS'
+        ...corsHeadersFor(req, { allowedOrigins: CORS_ALLOWED_ORIGINS })
       });
       res.end();
+      return;
+    }
+
+    // 【缺陷修复 G6】旧实现完全无鉴权：任何未登录访问者都能借本机出口请求天翼云内网面。
+    // 现要求仪表盘会话（注入页的 rewriteUrl 会自动附带 token 参数，见 /desktop-view）。
+    const session = getSessionFromReq(req, parsedUrl);
+    if (!session) {
+      jsonResponse(res, { error: 'Unauthorized' }, 401);
       return;
     }
 
@@ -3811,62 +3827,65 @@ function rewardNeedsDesktop(prodId, prodType) {
       return;
     }
 
-    try {
-      const parsedTarget = new URL(targetUrl);
-      if (!parsedTarget.hostname.endsWith('.ctyun.cn')) {
-        jsonResponse(res, { error: 'Invalid proxy target' }, 403);
-        return;
-      }
+    // 【缺陷修复 G6】精确 allowlist：仅 https + ctyun.cn 精确/子域 + 端口白名单，
+    // 拒用户信息与 IP 字面量（旧实现仅 endsWith('.ctyun.cn') 一条）。
+    const validation = validateProxyTarget(targetUrl);
+    if (!validation.ok) {
+      jsonResponse(res, { error: validation.error }, validation.statusCode);
+      return;
+    }
+    const parsedTarget = validation.url;
 
-      const bodyChunks = [];
-      req.on('data', chunk => bodyChunks.push(chunk));
-      req.on('end', async () => {
-        const bodyBuffer = Buffer.concat(bodyChunks);
-        const outgoingHeaders = {};
-        for (const [k, v] of Object.entries(req.headers)) {
-          const lk = k.toLowerCase();
-          if (lk === 'host' || lk === 'origin' || lk === 'referer' || lk === 'content-length') continue;
-          outgoingHeaders[k] = v;
+    // 请求体上限 10MB（旧实现无上限累积）；超限/断开由外层 catch 按 statusCode 映射
+    const bodyBuffer = await readRawBody(req, { maxBytes: PROXY_BODY_MAX_BYTES });
+
+    // 【缺陷修复 G6】敏感头不转发：authorization/cookie 是仪表盘凭据，转发即泄漏给上游
+    const outgoingHeaders = buildProxyHeaders(req.headers, parsedTarget);
+    if (bodyBuffer.length > 0) {
+      outgoingHeaders['content-length'] = bodyBuffer.length;
+    }
+
+    await new Promise((resolve) => {
+      const proxyReq = https.request(parsedTarget, {
+        method: req.method,
+        headers: outgoingHeaders,
+        // 【缺陷修复 G6】恢复 TLS 验证（旧实现 rejectUnauthorized:false）。
+        // 2026-10-24 只读探针实测 pc/desk.ctyun.cn:443/8810/8816 证书链 Verify code 均为 0。
+        rejectUnauthorized: true,
+        timeout: PROXY_UPSTREAM_TIMEOUT_MS,
+      }, proxyRes => {
+        const respHeaders = {};
+        for (const [k, v] of Object.entries(proxyRes.headers)) {
+          if (k.toLowerCase() === 'set-cookie') continue;
+          respHeaders[k] = v;
         }
-        outgoingHeaders['host'] = parsedTarget.host;
-        outgoingHeaders['origin'] = 'https://pc.ctyun.cn';
-        outgoingHeaders['referer'] = 'https://pc.ctyun.cn/';
-        if (bodyBuffer.length > 0) {
-          outgoingHeaders['content-length'] = bodyBuffer.length;
-        }
+        Object.assign(respHeaders, corsHeadersFor(req, { allowedOrigins: CORS_ALLOWED_ORIGINS }));
+        res.writeHead(proxyRes.statusCode, respHeaders);
+        proxyRes.pipe(res);
+        proxyRes.on('end', resolve);
+        proxyRes.on('error', () => resolve());
+      });
 
-        const clientModule = parsedTarget.protocol === 'http:' ? http : https;
-        const proxyReq = clientModule.request(targetUrl, {
-          method: req.method,
-          headers: outgoingHeaders,
-          rejectUnauthorized: false
-        }, proxyRes => {
-          const respHeaders = {};
-          for (const [k, v] of Object.entries(proxyRes.headers)) {
-            if (k.toLowerCase() === 'set-cookie') continue;
-            respHeaders[k] = v;
-          }
-          respHeaders['access-control-allow-origin'] = '*';
-          respHeaders['access-control-allow-headers'] = '*';
-          respHeaders['access-control-allow-methods'] = 'GET, POST, PUT, DELETE, OPTIONS';
-
-          res.writeHead(proxyRes.statusCode, respHeaders);
-          proxyRes.pipe(res);
-        });
-
-        proxyReq.on('error', err => {
+      proxyReq.on('timeout', () => {
+        proxyReq.destroy(new Error('Upstream timeout'));
+      });
+      proxyReq.on('error', err => {
+        if (!res.headersSent) {
           res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ error: 'Proxy request failed: ' + err.message }));
-        });
-
-        if (bodyBuffer.length > 0) {
-          proxyReq.write(bodyBuffer);
+        } else {
+          try { res.end(); } catch (e) {}
         }
-        proxyReq.end();
+        resolve();
       });
-    } catch (e) {
-      jsonResponse(res, { error: 'Malformed proxy request: ' + e.message }, 400);
-    }
+      // 客户端断开即终止上游请求（旧实现上游继续跑完并写已断开的 res）
+      req.on('aborted', () => { try { proxyReq.destroy(); } catch (e) {} resolve(); });
+
+      if (bodyBuffer.length > 0) {
+        proxyReq.write(bodyBuffer);
+      }
+      proxyReq.end();
+    });
     return;
   }
 
