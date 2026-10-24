@@ -817,6 +817,12 @@ function getOrCreateMasterKey() {
   }
 
   // 3. 首次全新初始化：生成 32 字节主密钥并双写持久化
+  // 【缺陷修复 G8】若已有任一密钥文件存在但内容无效，走到这里意味着旧密钥已不可用：
+  // 必须大声告警——新密钥无法解开既有 ENC: 密文，静默生成会把数据损坏伪装成密码错误。
+  const hadKeyMaterial = fs.existsSync(MASTER_KEY_FILE) || fs.existsSync(MASTER_KEY_BAK_FILE);
+  if (hadKeyMaterial) {
+    console.error('🔐 [主密钥] 主/备密钥文件均不可用，将生成新密钥；既有配置中的加密密码将无法解密，请从备份恢复 .master.key 或重新录入账号密码！');
+  }
   const newKey = crypto.randomBytes(32);
   const hexKey = newKey.toString('hex');
   try {
@@ -828,38 +834,19 @@ function getOrCreateMasterKey() {
 
 const masterKey = getOrCreateMasterKey();
 
+const { createPasswordCrypto } = require('./app/password_crypto');
+const passwordCrypto = createPasswordCrypto(masterKey, {
+  onError: (msg) => { console.error(`🔐 [密码加密] ${msg}`); },
+});
+
 function encryptPassword(plainText) {
-  if (!plainText || typeof plainText !== 'string') return '';
-  if (plainText.startsWith('ENC:')) return plainText; // 避免重复加密
-  try {
-    const iv = crypto.randomBytes(12);
-    const cipher = crypto.createCipheriv('aes-256-gcm', masterKey, iv);
-    let enc = cipher.update(plainText, 'utf8', 'hex');
-    enc += cipher.final('hex');
-    const authTag = cipher.getAuthTag().toString('hex');
-    return 'ENC:' + iv.toString('hex') + ':' + authTag + ':' + enc;
-  } catch (e) {
-    return plainText;
-  }
+  // 【缺陷修复 G8】加密失败直接抛错（模块实现），由 saveConfig 拦截，绝不回退明文落盘
+  return passwordCrypto.encryptPassword(plainText);
 }
 
 function decryptPassword(cipherText) {
-  if (!cipherText || typeof cipherText !== 'string') return '';
-  if (!cipherText.startsWith('ENC:')) return cipherText; // 兼容历史明文
-  try {
-    const parts = cipherText.split(':');
-    if (parts.length !== 4) return cipherText;
-    const iv = Buffer.from(parts[1], 'hex');
-    const authTag = Buffer.from(parts[2], 'hex');
-    const encrypted = parts[3];
-    const decipher = crypto.createDecipheriv('aes-256-gcm', masterKey, iv);
-    decipher.setAuthTag(authTag);
-    let dec = decipher.update(encrypted, 'hex', 'utf8');
-    dec += decipher.final('utf8');
-    return dec;
-  } catch (e) {
-    return cipherText;
-  }
+  // 【缺陷修复 G8】解密失败返回 '' 并记日志，绝不把密文本身当密码返回
+  return passwordCrypto.decryptPassword(cipherText);
 }
 
 // 2026-10-16 安全修复：接口层不再向前端明文返回账号密码。
@@ -1006,7 +993,7 @@ function loadConfig() {
 function saveConfig(cfg) {
   try {
     const configToSave = cfg || appConfig;
-    
+
     // 安全深拷贝用于加密落盘，内存中的密码仍然由各功能使用
     const diskClone = JSON.parse(JSON.stringify(configToSave));
     if (Array.isArray(diskClone.accounts)) {
@@ -1017,19 +1004,15 @@ function saveConfig(cfg) {
       }
     }
 
-    const jsonStr = JSON.stringify(diskClone, null, 2);
-    // 1. 原子写入主配置文件 (防崩溃/防断电截断)
-    atomicWriteFileSync(CONFIG_FILE, jsonStr, 'utf8');
-
-    // 2. 自动同步持久化备份文件 (app_config.json.bak)
-    if (Array.isArray(diskClone.accounts) || Array.isArray(diskClone.users)) {
-      try {
-        const BAK_FILE = CONFIG_FILE + '.bak';
-        atomicWriteFileSync(BAK_FILE, jsonStr, 'utf8');
-      } catch (e) {}
+    // 【缺陷修复 G8】落盘前断言：任一非空密码不是 ENC: 密文即中止保存。
+    // 旧实现加密失败回退明文且无校验，明文密码会被静默写进配置文件。
+    const plaintextLeak = (diskClone.accounts || []).find(a => a.password && !String(a.password).startsWith('ENC:'));
+    if (plaintextLeak) {
+      console.error('🔐 [保存配置] 检测到未加密的账号密码，已中止保存以防明文落盘');
+      return false;
     }
 
-    // 3. accounts.json 同样加密保护并原子写入
+    // accounts.json 载荷先行构建（加密异常时在任何文件写入前失败，避免半成品状态）
     const active = (configToSave.accounts || [])
       .filter(a => a.enabled !== false && a.features?.keepAlive !== false)
       .map(a => ({
@@ -1038,11 +1021,32 @@ function saveConfig(cfg) {
         password: encryptPassword(a.password),
         deviceCode: a.deviceCode
       }));
+    for (const entry of active) {
+      if (entry.password && !entry.password.startsWith('ENC:')) {
+        console.error('🔐 [保存配置] accounts.json 载荷含未加密密码，已中止保存');
+        return false;
+      }
+    }
     const ctyunJson = {
       keepAliveSeconds: configToSave.settings?.keepAliveSeconds || 60,
       accounts: active
     };
-    atomicWriteFileSync(ACCOUNTS_JSON, JSON.stringify(ctyunJson, null, 2), 'utf8');
+
+    const jsonStr = JSON.stringify(diskClone, null, 2);
+    // 【缺陷修复 G8】含凭据的落盘文件统一 0600（旧实现未传 mode，默认权限可被同机其他用户读）
+    // 1. 原子写入主配置文件 (防崩溃/防断电截断)
+    atomicWriteFileSync(CONFIG_FILE, jsonStr, 'utf8', 0o600);
+
+    // 2. 自动同步持久化备份文件 (app_config.json.bak)
+    if (Array.isArray(diskClone.accounts) || Array.isArray(diskClone.users)) {
+      try {
+        const BAK_FILE = CONFIG_FILE + '.bak';
+        atomicWriteFileSync(BAK_FILE, jsonStr, 'utf8', 0o600);
+      } catch (e) {}
+    }
+
+    // 3. accounts.json 同样加密保护并原子写入
+    atomicWriteFileSync(ACCOUNTS_JSON, JSON.stringify(ctyunJson, null, 2), 'utf8', 0o600);
     return true;
   } catch (e) {
     console.error('保存配置失败:', e);
