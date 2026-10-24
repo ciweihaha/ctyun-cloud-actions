@@ -516,7 +516,7 @@ function generateDeviceCode() {
 
 // SSRF 防护与 Webhook 安全发送已下沉 app/webhook_util（缺陷修复 G7）：
 // 在原字面校验基础上补 DNS 解析逐地址校验、重定向逐跳复检、超时与拒内嵌用户信息。
-const { isValidWebhookTarget, safeFetchJson } = require('./app/webhook_util');
+const { isValidWebhookTarget, safeFetchJson, redactUrlForLog } = require('./app/webhook_util');
 
 function isValidWebhookUrl(rawUrl) {
   return isValidWebhookTarget('webhook', rawUrl);
@@ -538,7 +538,7 @@ async function sendNotification(settings, title, content, extraVars = {}) {
 
   // SSRF 安全防御与有效性校验
   if (notify.webhookUrl && !isValidWebhookTarget(channel, notify.webhookUrl)) {
-    appendLog('Notify', `[安全拦截] 拒绝向私有/内网或非法协议地址发送 Webhook: ${notify.webhookUrl}`, 'error');
+    appendLog('Notify', `[安全拦截] 拒绝向私有/内网或非法协议地址发送 Webhook [${channel}]: ${redactUrlForLog(notify.webhookUrl)}`, 'error');
     return { success: false, message: '安全拦截：禁止向内网/本地私有地址或非法格式发送推送' };
   }
   
