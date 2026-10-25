@@ -366,7 +366,7 @@ if (signal.aborted) return Promise.reject(timeoutError());
 return Promise.race([
 promise,
 new Promise((_, reject) => {
-signal.addEventListener('abort', () => reject(timeoutError()), { once: true });
+const onAbort = () => reject(timeoutError()); signal.addEventListener('abort', onAbort, { once: true }); promise.then(() => signal.removeEventListener('abort', onAbort), () => signal.removeEventListener('abort', onAbort));
 }),
 ]);
 }
