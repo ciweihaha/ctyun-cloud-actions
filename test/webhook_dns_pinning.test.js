@@ -105,7 +105,7 @@ test('safeFetchJson: 重定向每一跳都重新钉扎，重绑定不影响第�
     }
     return res200();
   };
-  const r = await safeFetchJson('https://hooks.example.com/a', { fetchFn, lookupFn });
+  const r = await safeFetchJson('https://hooks.example.com/a', { fetchFn, lookupFn, redirectAllowlist: ['other.example.com'] });
   assert.equal(r.status, 200);
   assert.equal(seen.length, 2);
   assert.deepEqual(seen[0].pinnedIps, [PUB]);

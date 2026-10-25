@@ -32,14 +32,14 @@
 * - 安全拦截日志与 URL 非法报错曾拼接完整 webhookUrl（路径令牌、query、
 * @secret 均可入日志），统一改为 redactUrlForLog 脱敏后输出。
 */
-const net = require('net');
-const dns = require('dns');
-const http = require('http');
-const https = require('https');
-const { Readable } = require('stream');
-const { URL} = require('url');
+const net = require('net'); /* CTY-01 重定向策略：只管重定向跳，不管首跳选择；首跳 origin 由 safeFetchJson 记录（scheme+host+有效端口）；跨源默认拒绝，allowlist 放行并剥离敏感头（只保留 Content-Type）；allowlist 本身是信任边界，须定期复核。 */ const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]); function effectivePort(u) { return u.port ? Number(u.port) : (u.protocol === 'https:' ? 443 : 80); } function canonicalOrigin(u) { return `${u.protocol}//${u.hostname}:${effectivePort(u)}`; }
+const dns = require('dns'); function normalizeRedirectAllowlist(list) { const items = Array.isArray(list) ? list : (typeof list === 'string' ? list.split(',') : []); const out = new Set(); for (const raw of items) { const s = String(raw || '').trim().toLowerCase(); if (!s) continue; if (s.includes('://')) { try { out.add(canonicalOrigin(new URL(s))); } catch (e) {} } else out.add(s.replace(/^\[|\]$/g, '')); } return out; } function redirectAllowlistFromEnv() { return normalizeRedirectAllowlist(process.env.CTYUN_WEBHOOK_REDIRECT_ALLOWLIST); }
+const http = require('http'); function isAllowlistedRedirect(nextUrl, allowlist) { for (const entry of allowlist || []) { if (entry.includes('://')) { if (canonicalOrigin(nextUrl) === entry) return true; } else if (nextUrl.hostname.toLowerCase() === entry) return true; } return false; } function stripHeadersForCrossOrigin(headers) { const out = {}; for (const [k, v] of Object.entries(headers || {})) { if (String(k).toLowerCase() === 'content-type') out[k] = v; } return out; }
+const https = require('https'); function applyRedirectPolicy({ fromUrl, toUrl, status, method, body, headers, firstOrigin, allowlist }) { if (!REDIRECT_STATUSES.has(status)) throw new Error(`Webhook 重定向状态不允许跟随: ${status}`); const from = new URL(fromUrl); const to = new URL(toUrl); if (from.protocol === 'https:' && to.protocol === 'http:') throw new Error('Webhook 重定向不允许：https→http 跳转被拒绝'); const crossOrigin = canonicalOrigin(to) !== firstOrigin; let nextHeaders = { ...(headers || {}) }; let allowlisted = false; if (crossOrigin) { if (!isAllowlistedRedirect(to, allowlist)) throw new Error(`Webhook 跨源重定向被拒绝: ${redactUrlForLog(to.toString())}`); allowlisted = true; nextHeaders = stripHeadersForCrossOrigin(headers); } let nextMethod = method; let nextBody = body; if (status === 303 || (String(method || '').toUpperCase() === 'POST' && (status === 301 || status === 302))) { nextMethod = 'GET'; nextBody = undefined; } return { method: nextMethod, body: nextBody, headers: nextHeaders, crossOrigin, allowlisted }; }
+const { Readable } = require('stream'); /* CTY-02+CTY-03: IANA 特殊用途地址登记（RFC 6890、RFC 6598、RFC 3849 等）逐段 CIDR 位运算判定，替代前缀字符串匹配；建议每季度对照 IANA 登记复核一次。 */ function ipv4ToInt(s) { const p = s.split('.').map(Number); if (p.length !== 4 || p.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return null; return ((p[0] * 256 + p[1]) * 256 + p[2]) * 256 + p[3]; } function ipv4InCidr(ip, base, prefix) { const a = ipv4ToInt(ip); const b = ipv4ToInt(base); if (a === null || b === null) return false; const mask = prefix === 0 ? 0 : ((0xffffffff << (32 - prefix)) >>> 0); return (a & mask) === (b & mask); }
+const { URL} = require('url'); function ipv6Groups(s) { let t = s.split('%')[0].toLowerCase(); if (t.startsWith('::ffff:') && t.includes('.')) { const n = ipv4ToInt(t.slice(7)); if (n === null) return null; return [0, 0, 0, 0, 0, 0xffff, (n >>> 16) & 0xffff, n & 0xffff]; } if (t.includes('.')) { const i = t.lastIndexOf(':'); if (i < 0) return null; const n = ipv4ToInt(t.slice(i + 1)); if (n === null) return null; t = t.slice(0, i) + ':' + (((n >>> 16) & 0xffff).toString(16)) + ':' + ((n & 0xffff).toString(16)); } const parts = t.split('::'); if (parts.length > 2) return null; const head = parts[0] ? parts[0].split(':').filter(Boolean) : []; const tail = parts.length === 2 && parts[1] ? parts[1].split(':').filter(Boolean) : []; if (parts.length === 1 && head.length !== 8) return null; if (parts.length === 2 && head.length + tail.length > 7) return null; const mid = Array(8 - head.length - tail.length).fill('0'); const all = [...head, ...mid, ...tail].map((x) => parseInt(x, 16)); if (all.length !== 8 || all.some((n) => Number.isNaN(n) || n < 0 || n > 0xffff)) return null; return all; } function ipv6InCidr(groups, baseGroups, prefix) { for (let i = 0; i < 8; i++) { const bits = Math.max(0, Math.min(16, prefix - i * 16)); if (bits === 0) break; const mask = bits === 16 ? 0xffff : ((0xffff << (16 - bits)) & 0xffff); if ((groups[i] & mask) !== (baseGroups[i] & mask)) return false; } return true; }
 
-function isPrivateIpOrHost(hostname) {
+function isPrivateOrReservedIp(hostname) { const raw = (hostname || '').toLowerCase().trim(); if (!raw) return true; const h = raw.split('%')[0]; if (h === 'localhost') return true; if (net.isIPv4(h)) { const v4 = ['0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8', '169.254.0.0/16', '172.16.0.0/12', '192.0.0.0/24', '192.0.2.0/24', '192.168.0.0/16', '198.18.0.0/15', '198.51.100.0/24', '203.0.113.0/24', '224.0.0.0/4', '240.0.0.0/4']; return v4.some((c) => { const parts = c.split('/'); return ipv4InCidr(h, parts[0], Number(parts[1])); }); } if (h.includes(':')) { const g = ipv6Groups(h); if (!g) return false; if (g.slice(0, 5).every((x) => x === 0) && g[5] === 0xffff) { const v4int = g[6] * 65536 + g[7]; const v4str = [((v4int >>> 24) & 255), ((v4int >>> 16) & 255), ((v4int >>> 8) & 255), (v4int & 255)].join('.'); return isPrivateOrReservedIp(v4str); } const v6 = [['::', 128], ['::1', 128], ['64:ff9b::', 96], ['100::', 64], ['2001:db8::', 32], ['fc00::', 7], ['fe80::', 10], ['fec0::', 10]]; return v6.some((c) => { const bg = ipv6Groups(c[0]); return bg && ipv6InCidr(g, bg, c[1]); }); } return h.endsWith('.local') || h.endsWith('.internal') || h.endsWith('.lan'); } function isPrivateIpOrHost(hostname) { if (isPrivateOrReservedIp(hostname)) return true;
 const h = (hostname || '').toLowerCase().trim();
 if (!h) return true;
 if (h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '0.0.0.0') return true;
@@ -366,7 +366,7 @@ if (signal.aborted) return Promise.reject(timeoutError());
 return Promise.race([
 promise,
 new Promise((_, reject) => {
-signal.addEventListener('abort', () => reject(timeoutError()), { once: true });
+const onAbort = () => reject(timeoutError()); signal.addEventListener('abort', onAbort, { once: true }); promise.then(() => signal.removeEventListener('abort', onAbort), () => signal.removeEventListener('abort', onAbort));
 }),
 ]);
 }
@@ -480,13 +480,13 @@ fetchFn,
 lookupFn = defaultLookup,
 timeoutMs = 10000,
 maxRedirects = 3,
-maxBodyBytes = WEBHOOK_MAX_BODY_BYTES,
+maxBodyBytes = WEBHOOK_MAX_BODY_BYTES, redirectAllowlist, onRedirectAudit,
 } = {}) {
 const controller = new AbortController();
 const timeoutError = () => new Error(`Webhook 请求总超时（${timeoutMs}ms，含响应体读取）`);
-const timer = setTimeout(() => controller.abort(), timeoutMs);
+const timer = setTimeout(() => controller.abort(), timeoutMs); const allowlist = new Set([...normalizeRedirectAllowlist(redirectAllowlist), ...redirectAllowlistFromEnv()]);
 try {
-let current = urlString;
+let current = urlString; let firstOrigin = canonicalOrigin(new URL(urlString));
 for (let hop = 0; hop <= maxRedirects; hop++) {
 let u;
 try {
@@ -512,7 +512,7 @@ signal: controller.signal,
 pinnedIps,
 }), controller.signal, timeoutError);
 
-const isRedirect = res.status >= 300 && res.status < 400;
+const isRedirect = REDIRECT_STATUSES.has(res.status);
 const location = isRedirect && res.headers && typeof res.headers.get === 'function'
 ? res.headers.get('location')
 : null;
@@ -520,7 +520,7 @@ if (isRedirect && location) {
 if (hop === maxRedirects) throw new Error('Webhook 重定向次数过多');
 // 重定向响应的 body 不再使用，主动 cancel 以便连接尽早释放
 try { if (res.body && typeof res.body.cancel === 'function') await res.body.cancel(); } catch (e) {}
-current = new URL(location, u).toString();
+const nextUrl = new URL(location, u).toString(); const policy = applyRedirectPolicy({ fromUrl: current, toUrl: nextUrl, status: res.status, method, body, headers, firstOrigin, allowlist }); if (policy.crossOrigin && policy.allowlisted) { if (typeof onRedirectAudit === 'function') { onRedirectAudit({ from: current, to: nextUrl, status: res.status }); } else { console.warn('Webhook 跨源重定向放行:', redactUrlForLog(current), '->', redactUrlForLog(nextUrl), res.status); } } method = policy.method; body = policy.body; headers = policy.headers; current = nextUrl;
 continue;
 }
 
@@ -553,6 +553,6 @@ assertHostPublic,
 resolvePublicAddresses,
 createPinnedLookup,
 fetchWithPinnedIps,
-safeFetchJson,
+safeFetchJson, applyRedirectPolicy,
 redactUrlForLog,
 };
