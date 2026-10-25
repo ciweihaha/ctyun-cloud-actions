@@ -32,10 +32,10 @@
 * - 安全拦截日志与 URL 非法报错曾拼接完整 webhookUrl（路径令牌、query、
 * @secret 均可入日志），统一改为 redactUrlForLog 脱敏后输出。
 */
-const net = require('net');
-const dns = require('dns');
-const http = require('http');
-const https = require('https');
+const net = require('net'); /* CTY-01 重定向策略：只管重定向跳，不管首跳选择；首跳 origin 由 safeFetchJson 记录（scheme+host+有效端口）；跨源默认拒绝，allowlist 放行并剥离敏感头（只保留 Content-Type）；allowlist 本身是信任边界，须定期复核。 */ const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]); function effectivePort(u) { return u.port ? Number(u.port) : (u.protocol === 'https:' ? 443 : 80); } function canonicalOrigin(u) { return `${u.protocol}//${u.hostname}:${effectivePort(u)}`; }
+const dns = require('dns'); function normalizeRedirectAllowlist(list) { const items = Array.isArray(list) ? list : (typeof list === 'string' ? list.split(',') : []); const out = new Set(); for (const raw of items) { const s = String(raw || '').trim().toLowerCase(); if (!s) continue; if (s.includes('://')) { try { out.add(canonicalOrigin(new URL(s))); } catch (e) {} } else out.add(s.replace(/^\[|\]$/g, '')); } return out; } function redirectAllowlistFromEnv() { return normalizeRedirectAllowlist(process.env.CTYUN_WEBHOOK_REDIRECT_ALLOWLIST); }
+const http = require('http'); function isAllowlistedRedirect(nextUrl, allowlist) { for (const entry of allowlist || []) { if (entry.includes('://')) { if (canonicalOrigin(nextUrl) === entry) return true; } else if (nextUrl.hostname.toLowerCase() === entry) return true; } return false; } function stripHeadersForCrossOrigin(headers) { const out = {}; for (const [k, v] of Object.entries(headers || {})) { if (String(k).toLowerCase() === 'content-type') out[k] = v; } return out; }
+const https = require('https'); function applyRedirectPolicy({ fromUrl, toUrl, status, method, body, headers, firstOrigin, allowlist }) { if (!REDIRECT_STATUSES.has(status)) throw new Error(`Webhook 重定向状态不允许跟随: ${status}`); const from = new URL(fromUrl); const to = new URL(toUrl); if (from.protocol === 'https:' && to.protocol === 'http:') throw new Error('Webhook 重定向 https→http 被拒绝'); const crossOrigin = canonicalOrigin(to) !== firstOrigin; let nextHeaders = { ...(headers || {}) }; let allowlisted = false; if (crossOrigin) { if (!isAllowlistedRedirect(to, allowlist)) throw new Error(`Webhook 跨源重定向被拒绝: ${redactUrlForLog(to.toString())}`); allowlisted = true; nextHeaders = stripHeadersForCrossOrigin(headers); } let nextMethod = method; let nextBody = body; if (status === 303 || (String(method || '').toUpperCase() === 'POST' && (status === 301 || status === 302))) { nextMethod = 'GET'; nextBody = undefined; } return { method: nextMethod, body: nextBody, headers: nextHeaders, crossOrigin, allowlisted }; }
 const { Readable } = require('stream');
 const { URL} = require('url');
 
@@ -480,13 +480,13 @@ fetchFn,
 lookupFn = defaultLookup,
 timeoutMs = 10000,
 maxRedirects = 3,
-maxBodyBytes = WEBHOOK_MAX_BODY_BYTES,
+maxBodyBytes = WEBHOOK_MAX_BODY_BYTES, redirectAllowlist, onRedirectAudit,
 } = {}) {
 const controller = new AbortController();
 const timeoutError = () => new Error(`Webhook 请求总超时（${timeoutMs}ms，含响应体读取）`);
-const timer = setTimeout(() => controller.abort(), timeoutMs);
+const timer = setTimeout(() => controller.abort(), timeoutMs); const allowlist = new Set([...normalizeRedirectAllowlist(redirectAllowlist), ...redirectAllowlistFromEnv()]);
 try {
-let current = urlString;
+let current = urlString; let firstOrigin = canonicalOrigin(new URL(urlString));
 for (let hop = 0; hop <= maxRedirects; hop++) {
 let u;
 try {
@@ -512,7 +512,7 @@ signal: controller.signal,
 pinnedIps,
 }), controller.signal, timeoutError);
 
-const isRedirect = res.status >= 300 && res.status < 400;
+const isRedirect = REDIRECT_STATUSES.has(res.status);
 const location = isRedirect && res.headers && typeof res.headers.get === 'function'
 ? res.headers.get('location')
 : null;
@@ -520,7 +520,7 @@ if (isRedirect && location) {
 if (hop === maxRedirects) throw new Error('Webhook 重定向次数过多');
 // 重定向响应的 body 不再使用，主动 cancel 以便连接尽早释放
 try { if (res.body && typeof res.body.cancel === 'function') await res.body.cancel(); } catch (e) {}
-current = new URL(location, u).toString();
+const nextUrl = new URL(location, u).toString(); const policy = applyRedirectPolicy({ fromUrl: current, toUrl: nextUrl, status: res.status, method, body, headers, firstOrigin, allowlist }); if (policy.crossOrigin && policy.allowlisted) { if (typeof onRedirectAudit === 'function') { onRedirectAudit({ from: current, to: nextUrl, status: res.status }); } else { console.warn('Webhook 跨源重定向放行:', redactUrlForLog(current), '->', redactUrlForLog(nextUrl), res.status); } } method = policy.method; body = policy.body; headers = policy.headers; current = nextUrl;
 continue;
 }
 
@@ -553,6 +553,6 @@ assertHostPublic,
 resolvePublicAddresses,
 createPinnedLookup,
 fetchWithPinnedIps,
-safeFetchJson,
+safeFetchJson, applyRedirectPolicy,
 redactUrlForLog,
 };
