@@ -132,7 +132,7 @@ async function executeNativeAiChat(client, acc, onLog = console.log) {
   
   // 1. 获取网关信息并解密 SSO 公钥
   await diagDns('网关配置', 'gwyilian.ctyun.cn', onLog);
-  const sysRes = await netFetch('[1/4] 获取网关配置 eaiSysInfo', 'https://gwyilian.ctyun.cn/server/eaiSysInfo', {}, onLog);
+  let sysRes; const eaiSysInfoDelays = [5000, 15000]; for (let attempt = 1; attempt <= 3; attempt++) { try { sysRes = await netFetch('[1/4] 获取网关配置 eaiSysInfo', 'https://gwyilian.ctyun.cn/server/eaiSysInfo', {}, onLog); break; } catch (err) { if (attempt === 3) throw err; const delayMs = eaiSysInfoDelays[attempt - 1]; onLog('AIChat', 'AIChat eaiSysInfo attempt ' + attempt + '/3 failed, retrying in ' + (delayMs / 1000) + 's: ' + err.message, 'warning'); await new Promise(function (resolve) { setTimeout(resolve, delayMs); }); } }
   const sysJson = await sysRes.json();
   const rawSys = (sysJson.data || '').replace(/[\r\n]/g, '');
   const decipher = crypto.createDecipheriv('aes-128-ecb', Buffer.from('chinatelecom@cnn', 'utf8'), null);
