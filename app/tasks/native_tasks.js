@@ -232,7 +232,7 @@ async function executeNativeAiChat(client, acc, onLog = console.log) {
   authParams.append('clientKeyId', ssopkid);
 
   await diagDns('AI 对话站', 'eaichat.ctyun.cn', onLog);
-  const authPostRes = await netFetch('[3/4] SSO Ticket 换取 sessionKey', 'https://eaichat.ctyun.cn/sso/login/v2/iam/ticketAuthorize', {
+  let authPostRes; const ticketAuthorizeDelays = [5000, 15000]; for (let attempt = 1; attempt <= 3; attempt++) { try { authPostRes = await netFetch('[3/4] SSO Ticket 换取 sessionKey', 'https://eaichat.ctyun.cn/sso/login/v2/iam/ticketAuthorize', {
     method: 'POST',
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/137.0.0.0',
@@ -240,7 +240,7 @@ async function executeNativeAiChat(client, acc, onLog = console.log) {
       'Content-Type': 'application/x-www-form-urlencoded'
     },
     body: authParams.toString()
-  }, onLog);
+  }, onLog); break; } catch (err) { if (attempt === 3) throw err; const delayMs = ticketAuthorizeDelays[attempt - 1]; onLog('AIChat', 'AIChat ticketAuthorize attempt ' + attempt + '/3 failed, retrying in ' + (delayMs / 1000) + 's: ' + err.message, 'warning'); await new Promise(function (resolve) { setTimeout(resolve, delayMs); }); } }
 
   const authJson = await authPostRes.json();
   if (authJson.resultCode !== 0 || !authJson.data?.sessionKey) {
@@ -286,7 +286,7 @@ async function executeNativeAiChat(client, acc, onLog = console.log) {
   const webSign = sha256(rawSign);
   const traceId = crypto.randomUUID();
 
-  const chatRes = await netFetch('[4/4] 发送 AI 对话请求', 'https://eaichat.ctyun.cn/ai/portal/v3/openai/chat/completions', {
+  let chatRes; const chatCompletionsDelays = [5000, 15000]; for (let attempt = 1; attempt <= 3; attempt++) { try { chatRes = await netFetch('[4/4] 发送 AI 对话请求', 'https://eaichat.ctyun.cn/ai/portal/v3/openai/chat/completions', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -305,7 +305,7 @@ async function executeNativeAiChat(client, acc, onLog = console.log) {
       'Web-Timestamp': ts
     },
     body: bodyJsonStr
-  }, onLog);
+  }, onLog); break; } catch (err) { if (attempt === 3) throw err; const delayMs = chatCompletionsDelays[attempt - 1]; onLog('AIChat', 'AIChat chatCompletions attempt ' + attempt + '/3 failed, retrying in ' + (delayMs / 1000) + 's: ' + err.message, 'warning'); await new Promise(function (resolve) { setTimeout(resolve, delayMs); }); } }
 
   if (!chatRes.ok) {
     throw new Error(`AI 对话接口异常 (HTTP ${chatRes.status})`);
