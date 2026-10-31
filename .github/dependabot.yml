@@ -1,0 +1,18 @@
+# 依赖与 Actions 自动更新（GitHub 全账户审计修复 GH-D1）：
+# - npm：每周检查依赖更新（package-lock.json 冻结安装）
+# - github-actions：把已钉完整 SHA 的 Action 自动升到新版本
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
+      prefix-development: chore
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
