@@ -338,13 +338,20 @@ async function executeNativeAiChat(client, acc, onLog = console.log) {
   }
 
   const resText = await chatRes.text();
+  // 深查第 1 轮：旧 try/catch 只重抛业务错误，非 JSON 响应（如错误页、
+  // 被截断的体）导致 JSON.parse 抛 SyntaxError 时会被吞掉，随后仍
+  // 走到“✅ 成功、已获取 100 积分”日志并返回 success:true，属于
+  // 假成功。现区分三路：业务错误重抛；解析失败抛错；其余才算成功。
+  // 注意：积分本身仍由后续 refreshOfficialTasks 复核，本处只保证
+  // “响应不可解析”不再被说成成功，不改动积分口径。
+  let chatJson;
   try {
-    const chatJson = JSON.parse(resText);
-    if (chatJson.code && chatJson.code !== 0 && chatJson.code !== 200) {
-      throw new Error(`AI 对话业务返回错误: ${chatJson.message || chatJson.msg || resText}`);
-    }
+    chatJson = JSON.parse(resText);
   } catch (e) {
-    if (e.message && e.message.startsWith('AI 对话业务返回错误')) throw e;
+    throw new Error(`AI 对话返回非 JSON，无法确认业务结果: ${String(resText).slice(0, 200)}`);
+  }
+  if (chatJson.code && chatJson.code !== 0 && chatJson.code !== 200) {
+    throw new Error(`AI 对话业务返回错误: ${chatJson.message || chatJson.msg || resText}`);
   }
   onLog('AIChat', `✅ AI 对话成功完成！已获取今日 100 积分！(全流程耗时 ${Math.round((Date.now() - flowStartedAt) / 1000)}s)`, 'success');
   
