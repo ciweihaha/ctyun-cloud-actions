@@ -143,7 +143,10 @@ async function withRetry(stepLabel, fn, onLog = console.log, delays = [5000, 150
     } catch (err) {
       if (attempt === 3) throw err;
       const delayMs = delays[attempt - 1];
-      onLog('AIChat', 'AIChat ' + stepLabel + ' attempt ' + attempt + '/3 failed, retrying in ' + (delayMs / 1000) + 's: ' + err.message, 'warning');
+      // 2026-11-05 第 2 轮：只修日志文案，不改重试语义。原写法直接读 err.message，
+      // 若回调抛的不是 Error（如字符串），日志会写成 undefined；现用安全取值兜底。
+      const errMsg = err && typeof err.message === 'string' ? err.message : String(err);
+      onLog('AIChat', 'AIChat ' + stepLabel + ' attempt ' + attempt + '/3 failed, retrying in ' + (delayMs / 1000) + 's: ' + errMsg, 'warning');
       await new Promise(function (resolve) { setTimeout(resolve, delayMs); });
     }
   }
