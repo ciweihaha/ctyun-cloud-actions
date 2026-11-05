@@ -124,6 +124,32 @@ async function netFetch(label, url, options = {}, onLog = console.log, src = 'AI
 }
 
 /**
+ * 传输层重试工具：仅复用三处已有重试的形态，不改变任何语义。
+ * - 仅当 fn 抛出时重试。netFetch 只在 fetch 抛错（传输/超时/中断）时抛，
+ *   HTTP 非 200 会正常返回 Response，不触发重试 —— 与三处原循环完全一致。
+ *   因此本工具的注释与行为均写明：仅传输/超时重试，HTTP 非 200 不重试。
+ * - 初次 + 最多 2 次重试，共 3 次；延迟固定 [5000, 15000]，与原数组逐项一致；
+ *   第 3 次失败直接抛原错误，不再等待。
+ * - 失败日志文案与原循环逐字一致，便于按原日志检索。
+ * - 不改动步骤 3/4 的语义：回调只包一次 netFetch 调用，ticket、签名、
+ *   traceId 等均在循环外一次性生成，重试复用同一份请求体与同一 traceId，
+ *   与原循环一致。ticket 是否一次性消费、client_retry:true 与
+ *   x-client-trace-id 的去重语义均未验证，本工具不验证、不改变、不声称解决。
+ */
+async function withRetry(stepLabel, fn, onLog = console.log, delays = [5000, 15000]) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (attempt === 3) throw err;
+      const delayMs = delays[attempt - 1];
+      onLog('AIChat', 'AIChat ' + stepLabel + ' attempt ' + attempt + '/3 failed, retrying in ' + (delayMs / 1000) + 's: ' + err.message, 'warning');
+      await new Promise(function (resolve) { setTimeout(resolve, delayMs); });
+    }
+  }
+}
+
+/**
  * 纯原生毫秒级 HTTP 协议直连执行天翼 AI 对话任务 (彻底剔除 Chromium/Puppeteer)
  */
 async function executeNativeAiChat(client, acc, onLog = console.log) {
@@ -132,7 +158,7 @@ async function executeNativeAiChat(client, acc, onLog = console.log) {
   
   // 1. 获取网关信息并解密 SSO 公钥
   await diagDns('网关配置', 'gwyilian.ctyun.cn', onLog);
-  let sysRes; const eaiSysInfoDelays = [5000, 15000]; for (let attempt = 1; attempt <= 3; attempt++) { try { sysRes = await netFetch('[1/4] 获取网关配置 eaiSysInfo', 'https://gwyilian.ctyun.cn/server/eaiSysInfo', {}, onLog); break; } catch (err) { if (attempt === 3) throw err; const delayMs = eaiSysInfoDelays[attempt - 1]; onLog('AIChat', 'AIChat eaiSysInfo attempt ' + attempt + '/3 failed, retrying in ' + (delayMs / 1000) + 's: ' + err.message, 'warning'); await new Promise(function (resolve) { setTimeout(resolve, delayMs); }); } }
+  const sysRes = await withRetry('eaiSysInfo', function () { return netFetch('[1/4] 获取网关配置 eaiSysInfo', 'https://gwyilian.ctyun.cn/server/eaiSysInfo', {}, onLog); }, onLog);
   const sysJson = await sysRes.json();
   const rawSys = (sysJson.data || '').replace(/[\r\n]/g, '');
   const decipher = crypto.createDecipheriv('aes-128-ecb', Buffer.from('chinatelecom@cnn', 'utf8'), null);
@@ -232,7 +258,7 @@ async function executeNativeAiChat(client, acc, onLog = console.log) {
   authParams.append('clientKeyId', ssopkid);
 
   await diagDns('AI 对话站', 'eaichat.ctyun.cn', onLog);
-  let authPostRes; const ticketAuthorizeDelays = [5000, 15000]; for (let attempt = 1; attempt <= 3; attempt++) { try { authPostRes = await netFetch('[3/4] SSO Ticket 换取 sessionKey', 'https://eaichat.ctyun.cn/sso/login/v2/iam/ticketAuthorize', {
+  const authPostRes = await withRetry('ticketAuthorize', function () { return netFetch('[3/4] SSO Ticket 换取 sessionKey', 'https://eaichat.ctyun.cn/sso/login/v2/iam/ticketAuthorize', {
     method: 'POST',
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/137.0.0.0',
@@ -240,7 +266,7 @@ async function executeNativeAiChat(client, acc, onLog = console.log) {
       'Content-Type': 'application/x-www-form-urlencoded'
     },
     body: authParams.toString()
-  }, onLog); break; } catch (err) { if (attempt === 3) throw err; const delayMs = ticketAuthorizeDelays[attempt - 1]; onLog('AIChat', 'AIChat ticketAuthorize attempt ' + attempt + '/3 failed, retrying in ' + (delayMs / 1000) + 's: ' + err.message, 'warning'); await new Promise(function (resolve) { setTimeout(resolve, delayMs); }); } }
+  }, onLog); }, onLog);
 
   const authJson = await authPostRes.json();
   if (authJson.resultCode !== 0 || !authJson.data?.sessionKey) {
@@ -286,7 +312,7 @@ async function executeNativeAiChat(client, acc, onLog = console.log) {
   const webSign = sha256(rawSign);
   const traceId = crypto.randomUUID();
 
-  let chatRes; const chatCompletionsDelays = [5000, 15000]; for (let attempt = 1; attempt <= 3; attempt++) { try { chatRes = await netFetch('[4/4] 发送 AI 对话请求', 'https://eaichat.ctyun.cn/ai/portal/v3/openai/chat/completions', {
+  const chatRes = await withRetry('chatCompletions', function () { return netFetch('[4/4] 发送 AI 对话请求', 'https://eaichat.ctyun.cn/ai/portal/v3/openai/chat/completions', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -305,7 +331,7 @@ async function executeNativeAiChat(client, acc, onLog = console.log) {
       'Web-Timestamp': ts
     },
     body: bodyJsonStr
-  }, onLog); break; } catch (err) { if (attempt === 3) throw err; const delayMs = chatCompletionsDelays[attempt - 1]; onLog('AIChat', 'AIChat chatCompletions attempt ' + attempt + '/3 failed, retrying in ' + (delayMs / 1000) + 's: ' + err.message, 'warning'); await new Promise(function (resolve) { setTimeout(resolve, delayMs); }); } }
+  }, onLog); }, onLog);
 
   if (!chatRes.ok) {
     throw new Error(`AI 对话接口异常 (HTTP ${chatRes.status})`);
