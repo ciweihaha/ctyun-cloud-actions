@@ -227,3 +227,46 @@ test('runAllAccounts: 网页避让跳过的账号按官方状态纳入判定', a
   const today = new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' });
   assert.equal(s.lastCompletedDate, today, '官方已全达成的避让账号应判完成');
 });
+
+test('getTargetTimes: 非法 executeTime 丢弃并回退默认 01:20（深查第 2 轮）', () => {
+  const cases = [
+    ['abc', ['01:20']],
+    ['1：20', ['01:20']], // 全角冒号，中文输入法常见误输
+    ['25:99', ['01:20']], // 越界，不再依赖 Date 进位回绕
+    ['01:20,abc,02:30', ['01:20', '02:30']], // 部分非法只丢弃非法项
+    ['1:5', ['1:5']], // 既有合法输入不变
+    ['01:20:30', ['01:20:30']], // 秒段既有容忍口径不变
+    ['', ['01:20']],
+    [120, ['01:20']], // 非字符串不抛错，回退默认
+  ];
+  for (const [input, expected] of cases) {
+    const { s } = makeScheduler({ accounts: [], settings: { cron: { executeTime: input, enableSubCron: false } }, clients: {} });
+    assert.deepEqual(s.getTargetTimes(), expected, `executeTime=${JSON.stringify(input)}`);
+  }
+});
+
+test('getTargetTimes: 同一非法配置只告警一次', () => {
+  const { s, logs } = makeScheduler({ accounts: [], settings: { cron: { executeTime: 'abc', enableSubCron: false } }, clients: {} });
+  s.getTargetTimes();
+  s.getTargetTimes();
+  s.getTargetTimes();
+  const warns = logs.filter(l => /触发时间配置非法/.test(l.msg));
+  assert.equal(warns.length, 1, `同一非法配置应只告警一次，实际 ${warns.length}`);
+  assert.ok(/已回退默认 01:20/.test(warns[0].msg));
+});
+
+test('scheduleNextRun: 非法 executeTime 不再挂载 NaN 延时（深查第 2 轮）', () => {
+  const { s } = makeScheduler({ accounts: [], settings: { cron: { executeTime: 'abc', enableSubCron: false } }, clients: {} });
+  const delays = [];
+  const origSetTimeout = global.setTimeout;
+  global.setTimeout = (fn, ms, ...a) => { delays.push(ms); return origSetTimeout(fn, ms, ...a); };
+  try {
+    s.scheduleNextRun();
+  } finally {
+    global.setTimeout = origSetTimeout;
+    s.stop();
+  }
+  assert.equal(delays.length, 1);
+  assert.ok(Number.isFinite(delays[0]), `延时必须为有限数，实际 ${delays[0]}`);
+  assert.ok(delays[0] >= 1000, `延时不得小于 1000ms，实际 ${delays[0]}`);
+});
