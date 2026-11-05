@@ -162,6 +162,26 @@ function isRedeemDueToday(rConf, todayStr) {
   return days.includes(cstDay) || (days.includes(-1) && cstDay === lastDayOfMonth);
 }
 
+/**
+ * 校验单个主调度触发时间（深查第 2 轮，2026-11-05）：
+ * 形如 H:MM / HH:MM，时 0-23、分 0-59；为兼容既有容忍口径，允许可选的秒段
+ * （如 01:20:30，scheduleNextRun 本就只取前两段）。其余一律非法。
+ */
+function isValidTargetTime(t) {
+  const parts = String(t).split(':');
+  if (parts.length < 2 || parts.length > 3) return false;
+  if (!/^\d+$/.test(parts[0]) || !/^\d+$/.test(parts[1])) return false;
+  if (parts.length === 3 && !/^\d+$/.test(parts[2])) return false;
+  const h = Number(parts[0]);
+  const m = Number(parts[1]);
+  if (h < 0 || h > 23 || m < 0 || m > 59) return false;
+  if (parts.length === 3) {
+    const s = Number(parts[2]);
+    if (s < 0 || s > 59) return false;
+  }
+  return true;
+}
+
 class TaskScheduler {
 
   constructor({ getAccounts, getSettings, getClient, appendLog, sendNotification, saveConfig }) {
@@ -282,12 +302,34 @@ class TaskScheduler {
     return Object.values(states).every(s => s.status === TASK_STATUS.COMPLETED || s.status === TASK_STATUS.SKIPPED);
   }
 
+  /**
+   * 主调度触发时间点（深查第 2 轮，2026-11-05：非法项校验与回退）。
+   * 旧实现只做字符串切分、不校验：server.js PUT /api/settings 对
+   * cron.executeTime 无任何格式校验（只校验了 webhook），非法值（如 "abc"、
+   * 全角冒号 "1：20"）会原样进入 scheduleNextRun；其 split(':').map(Number)
+   * 得 NaN → Invalid Date → delayMs = Math.max(1000, NaN) = NaN →
+   * setTimeout(fn, NaN) 约 1ms 即触发，回调跑完 runAllAccounts 又调
+   * scheduleNextRun，形成无间隔循环重跑全部账号任务（本地实测 500ms 内
+   * 触发 375 次）。现于本函数单点收敛：非法项丢弃、全部非法时回退默认
+   * 01:20（与既有默认一致），并按配置原文去重告警一次（heartbeatTick
+   * 每 30 秒调本函数，不去重会刷屏；与分项 Cron 的 _cronWarned 同口径）。
+   * 既有合法输入（"1:5"、"01:20"、"01:20:30"）行为不变；"25:99" 类越界值
+   * 不再依赖 Date 的进位回绕，同样回退默认并告警。
+   */
   getTargetTimes() {
     const settings = this.getSettings() || {};
     const cron = settings.cron || {};
-    const rawTimes = cron.executeTime || cron.taskTime || '01:20';
+    const rawTimes = String(cron.executeTime || cron.taskTime || '01:20');
     const list = rawTimes.split(/[,，\s]+/).map(t => t.trim()).filter(Boolean);
-    return list.length > 0 ? list : ['01:20'];
+    const valid = list.filter(isValidTargetTime);
+    if (valid.length === list.length) return list.length > 0 ? list : ['01:20'];
+    if (!this._targetTimesWarned) this._targetTimesWarned = new Set();
+    if (!this._targetTimesWarned.has(rawTimes)) {
+      this._targetTimesWarned.add(rawTimes);
+      const dropped = list.filter(t => !valid.includes(t));
+      this.appendLog('Scheduler', `⚠️ 每日任务触发时间配置非法，已忽略: ${dropped.join(', ')}（须为 HH:MM，时 0-23、分 0-59）${valid.length > 0 ? `，其余 ${valid.join(', ')} 仍生效` : '，已回退默认 01:20'}，请检查系统设置`, 'warning');
+    }
+    return valid.length > 0 ? valid : ['01:20'];
   }
 
   /**
