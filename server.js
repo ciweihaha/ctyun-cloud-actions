@@ -35,6 +35,7 @@ const requestContext = new AsyncLocalStorage();
 // 【缺陷修复 G5】CORS 仅同源或 CTYUN_CORS_ORIGINS 名单（逗号分隔）放行，替代全站 '*'
 const CORS_ALLOWED_ORIGINS = parseAllowedOrigins(process.env.CTYUN_CORS_ORIGINS);
 const { TaskScheduler } = require('./app/tasks/scheduler');
+const { validateSettingsUpdate } = require('./app/settings_validation');
 const { SohoClient } = require('./app/ydpc/soho_client');
 const { performCagAuthHold } = require('./app/ydpc/cag_client');
 const { YdpcClient } = require('./app/ydpc/ydpc_client');
@@ -6172,7 +6173,18 @@ function rewardNeedsDesktop(prodId, prodType) {
     }
 
     const body = await parseJsonBody(req);
-    
+
+    // 深查第 3 轮：数值/时间型设置保存入口前置校验（此前只校验 webhook，
+    // 非法 keepAliveSeconds / pulseIntervalSeconds / cron.executeTime 原样落盘
+    // 并即时热更新：非数值 keepAliveSeconds 会让 resetCycleTimeout 挂出
+    // setTimeout(fn, NaN)，约 1ms 即掐断正在运行的会话；非法 executeTime
+    // 则静默落盘、只在调度器侧回退告警。非法一律 400 拒绝，不落盘）。
+    const settingsCheck = validateSettingsUpdate(body);
+    if (!settingsCheck.ok) {
+      jsonResponse(res, { error: settingsCheck.error }, 400);
+      return;
+    }
+
     // SSRF 防御校验：检查 Webhook 地址合法性
     if (body.notify && body.notify.webhookUrl) {
       const targetUrl = String(body.notify.webhookUrl).trim();
@@ -6183,7 +6195,7 @@ function rewardNeedsDesktop(prodId, prodType) {
       }
     }
 
-    appConfig.settings = { ...appConfig.settings, ...body };
+    appConfig.settings = { ...appConfig.settings, ...settingsCheck.normalized };
     saveConfig(appConfig);
     appendLog('System', '全局设置已更新，定时调度与配置已即时热重载生效', 'info');
 
