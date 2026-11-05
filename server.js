@@ -35,7 +35,7 @@ const requestContext = new AsyncLocalStorage();
 // 【缺陷修复 G5】CORS 仅同源或 CTYUN_CORS_ORIGINS 名单（逗号分隔）放行，替代全站 '*'
 const CORS_ALLOWED_ORIGINS = parseAllowedOrigins(process.env.CTYUN_CORS_ORIGINS);
 const { TaskScheduler } = require('./app/tasks/scheduler');
-const { validateSettingsUpdate } = require('./app/settings_validation');
+const { validateSettingsUpdate, sanitizeSettingsForRestore } = require('./app/settings_validation');
 const { SohoClient } = require('./app/ydpc/soho_client');
 const { performCagAuthHold } = require('./app/ydpc/cag_client');
 const { YdpcClient } = require('./app/ydpc/ydpc_client');
@@ -6600,14 +6600,28 @@ function rewardNeedsDesktop(prodId, prodType) {
     }
 
     // 管理员导入时若带 settings 则一并更新
+    // 深查第 4 轮：此前此处原样合并 body.settings、不走第 3 轮校验，
+    // 含非法值的旧备份会把脏值落盘；重启后新会话的 pulseConnectSec 由
+    // "abc" 算出 NaN，约 1ms 即 endSession('Pulse Finished')，即使不重启，
+    // 之后任意一次无关 PUT 也会把脏值再喂给 resetCycleTimeout（只读现值、
+    // 不重验），约 1ms 掐断全部正在运行的会话。现复用同一校验口径做
+    // “丢弃式”清洗：还原语义与 PUT 不同，账号是还原主体，非法设置字段
+    // 只丢弃、不整单拒绝（否则一个脏设置会堵死整份账号还原），现有好值
+    // 保留；合法字段归一化后合并，丢弃项记日志并在响应中回告。
+    let settingsDropped = [];
     if (session.role === 'admin' && body.settings && typeof body.settings === 'object') {
-      appConfig.settings = { ...appConfig.settings, ...body.settings };
+      const { sanitized, dropped } = sanitizeSettingsForRestore(body.settings, appConfig.settings);
+      settingsDropped = dropped;
+      appConfig.settings = { ...appConfig.settings, ...sanitized };
+      if (dropped.length > 0) {
+        appendLog('System', `⚠️ 备份 settings 中 ${dropped.length} 个非法字段已丢弃（${dropped.join('、')}），保留当前值；其余合法字段已还原。如与预期不符，请前往「系统设置」核对调整。`, 'warning');
+      }
       appendLog('System', `⚠️ 备份文件包含系统设置，已一并还原 (保活周期: ${appConfig.settings.keepAliveSeconds}s / 脉冲间隔: ${(appConfig.settings.pulseIntervalSeconds || (appConfig.settings.pulseIntervalMinutes || 45) * 60)}秒 / 触发时间: ${appConfig.settings.cron?.executeTime || '01:20'})。如与预期不符，请前往「系统设置」核对调整。`, 'warning');
     }
 
     saveConfig(appConfig);
     appendLog('System', `用户 [${session.username}] 成功导入/恢复了 ${importedCount} 个云电脑配置`, 'success');
-    jsonResponse(res, { success: true, importedCount, message: `成功导入 ${importedCount} 个账号配置并自动上线保活！` });
+    jsonResponse(res, { success: true, importedCount, ...(settingsDropped.length > 0 ? { settingsDropped } : {}), message: `成功导入 ${importedCount} 个账号配置并自动上线保活！` });
     return;
   }
 
