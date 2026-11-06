@@ -36,6 +36,8 @@
  * （否则字符串 cron 会整块覆盖掉原 cron 对象）；pulseIntervalMinutes
  * 旧字段纳入校验（整数 1–55 分钟，见常量注释）。另新增
  * sanitizeSettingsForRestore，供备份还原路径复用同一口径做“丢弃式”清洗。
+ * 深查第 5 轮补记：cron 子项（enableSubCron 与 5 个分项表达式）纳入类型校验——
+ * 非字符串表达式会使调度器 `?.trim()` 读值抛 TypeError，见 scheduler.js cronExprText。
  *
  * @param {object} body - PUT /api/settings 的 JSON 体
  * @returns {{ok:true, normalized:object}|{ok:false, error:string}}
@@ -53,6 +55,10 @@ const PULSE_MAX = 3300;
 // 折算成秒须落在 pulseIntervalSeconds 的 10–3300 秒窗口内，故取 1–55 分钟。
 const PULSE_MINUTES_MIN = 1;
 const PULSE_MINUTES_MAX = 55;
+// 深查第 5 轮：分项 Cron 表达式字段（scheduler.js 的 hasActiveSubCronRules /
+// getSubCronMap / heartbeatTick 巡检与触发分支均以 `?.trim()` 读值，
+// 非字符串真值会抛 TypeError 并掐断三条调度触发路径；见 scheduler.js cronExprText）。
+const SUB_CRON_FIELDS = ['signCron', 'aiChatCron', 'cloudHangCron', 'browserHangCron', 'redeemCron'];
 
 /**
  * 与 app/tasks/scheduler.js isValidTargetTime 同口径（深查第 2 轮既定口径）：
@@ -138,6 +144,18 @@ function validateSettingsUpdate(body) {
         return { ok: false, error: '每日任务触发时间 executeTime 须为 HH:MM（时 0–23、分 0–59）' };
       }
     }
+    // 深查第 5 轮：分项 Cron 开关须为布尔值（字符串 'false' 为真值，
+    // 会误启用分项调度），各分项表达式须为字符串。只校验类型，不校验
+    // 表达式内容本身：非法字符串仍由调度器侧 validateCronExpression
+    // 在运行时告警并跳过（既有口径，本轮不收紧）。
+    if (!isAbsent(body.cron.enableSubCron) && typeof body.cron.enableSubCron !== 'boolean') {
+      return { ok: false, error: '分项 Cron 开关 enableSubCron 须为布尔值' };
+    }
+    for (const key of SUB_CRON_FIELDS) {
+      if (!isAbsent(body.cron[key]) && typeof body.cron[key] !== 'string') {
+        return { ok: false, error: `分项 Cron 表达式 ${key} 须为字符串` };
+      }
+    }
   }
 
   return { ok: true, normalized };
@@ -212,6 +230,26 @@ function sanitizeSettingsForRestore(imported, current) {
           dropped.push('cron.executeTime');
         }
       }
+      // 深查第 5 轮：与 PUT 同口径，非字符串分项表达式与非布尔开关只丢弃、
+      // 不整单拒绝；空值删除后由深合并保留现值。
+      if ('enableSubCron' in cronCopy) {
+        const es = cronCopy.enableSubCron;
+        if (isAbsent(es)) delete cronCopy.enableSubCron;
+        else if (typeof es !== 'boolean') {
+          delete cronCopy.enableSubCron;
+          dropped.push('cron.enableSubCron');
+        }
+      }
+      for (const key of SUB_CRON_FIELDS) {
+        if (key in cronCopy) {
+          const v = cronCopy[key];
+          if (isAbsent(v)) delete cronCopy[key];
+          else if (typeof v !== 'string') {
+            delete cronCopy[key];
+            dropped.push(`cron.${key}`);
+          }
+        }
+      }
       const curCron =
         current && typeof current === 'object' && current.cron &&
         typeof current.cron === 'object' && !Array.isArray(current.cron)
@@ -234,4 +272,5 @@ module.exports = {
   PULSE_MAX,
   PULSE_MINUTES_MIN,
   PULSE_MINUTES_MAX,
+  SUB_CRON_FIELDS,
 };
