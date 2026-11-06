@@ -77,6 +77,19 @@ function validateCronExpression(expr) {
   return { ok: true };
 }
 
+/**
+ * 分项 Cron 表达式读值（深查第 5 轮）：只接受字符串，非字符串一律按“未填写”处理。
+ * PUT / 还原入口已拦非字符串；手工改配置文件仍可能落盘非字符串值，而旧实现
+ * `cron.signCron?.trim()` 对数字 / 布尔 / 对象照样抛 `TypeError: ... .trim is not
+ * a function`（`?.` 只 guard null / undefined，不 guard 属性本身不存在）。
+ * 该异常会掐断 heartbeatTick、checkStartupCatchup 与 scheduleNextRun 回调内的
+ * getSubCronMap 调用——三条触发路径全灭，且精确定时器抛错后不再重挂。
+ */
+function cronExprText(cron, key) {
+  const v = cron ? cron[key] : undefined;
+  return typeof v === 'string' ? v.trim() : '';
+}
+
 function matchCronField(field, val) {
   if (field === '*') return true;
   const parts = field.split(',');
@@ -476,7 +489,7 @@ class TaskScheduler {
     const settings = this.getSettings() || {};
     const cron = settings.cron || {};
     if (!cron.enableSubCron) return false;
-    return !!(cron.signCron?.trim() || cron.aiChatCron?.trim() || cron.cloudHangCron?.trim() || cron.browserHangCron?.trim() || cron.redeemCron?.trim());
+    return !!(cronExprText(cron, 'signCron') || cronExprText(cron, 'aiChatCron') || cronExprText(cron, 'cloudHangCron') || cronExprText(cron, 'browserHangCron') || cronExprText(cron, 'redeemCron'));
   }
 
   /**
@@ -491,11 +504,11 @@ class TaskScheduler {
       return { sign: false, aiChat: false, cloudHang: false, browserHang: false, redeem: false };
     }
     return {
-      sign: !!cron.signCron?.trim(),
-      aiChat: !!cron.aiChatCron?.trim(),
-      cloudHang: !!cron.cloudHangCron?.trim(),
-      browserHang: !!cron.browserHangCron?.trim(),
-      redeem: !!cron.redeemCron?.trim()
+      sign: !!cronExprText(cron, 'signCron'),
+      aiChat: !!cronExprText(cron, 'aiChatCron'),
+      cloudHang: !!cronExprText(cron, 'cloudHangCron'),
+      browserHang: !!cronExprText(cron, 'browserHangCron'),
+      redeem: !!cronExprText(cron, 'redeemCron')
     };
   }
 
@@ -529,7 +542,7 @@ class TaskScheduler {
     if (cron.enableSubCron) {
       if (!this._cronWarned) this._cronWarned = new Set();
       for (const [label, expr] of [['签到打卡', cron.signCron], ['AI 对话', cron.aiChatCron], ['云电脑挂机', cron.cloudHangCron], ['浏览器真挂机', cron.browserHangCron], ['自动兑换', cron.redeemCron]]) {
-        if (expr && expr.trim()) {
+        if (typeof expr === 'string' && expr.trim()) {
           const v = validateCronExpression(expr.trim());
           if (!v.ok && !this._cronWarned.has(expr)) {
             this._cronWarned.add(expr);
@@ -559,8 +572,8 @@ class TaskScheduler {
     const accounts = (this.getAccounts() || []).filter(a => a.enabled);
 
     // 2.1 每日签到打卡分项规则
-    if (cron.signCron?.trim()) {
-      if (shouldRunCron(cron.signCron.trim(), bj)) {
+    if (cronExprText(cron, 'signCron')) {
+      if (shouldRunCron(cronExprText(cron, 'signCron'), bj)) {
         this.lastTriggerMinute = currentMinKey;
         this.appendLog('Scheduler', `⏰ 触发分项辅助规则 [签到打卡] (Cron: ${cron.signCron})...`, 'info');
         for (const acc of accounts) {
@@ -597,8 +610,8 @@ class TaskScheduler {
     }
 
     // 2.2 AI 智能对话分项规则
-    if (cron.aiChatCron?.trim()) {
-      if (shouldRunCron(cron.aiChatCron.trim(), bj)) {
+    if (cronExprText(cron, 'aiChatCron')) {
+      if (shouldRunCron(cronExprText(cron, 'aiChatCron'), bj)) {
         this.lastTriggerMinute = currentMinKey;
         this.appendLog('Scheduler', `⏰ 触发分项辅助规则 [AI 对话] (Cron: ${cron.aiChatCron})...`, 'info');
         for (const acc of accounts) {
@@ -620,8 +633,8 @@ class TaskScheduler {
     }
 
     // 2.3 云电脑挂机守护分项规则
-    if (cron.cloudHangCron?.trim()) {
-      if (shouldRunCron(cron.cloudHangCron.trim(), bj)) {
+    if (cronExprText(cron, 'cloudHangCron')) {
+      if (shouldRunCron(cronExprText(cron, 'cloudHangCron'), bj)) {
         this.lastTriggerMinute = currentMinKey;
         this.appendLog('Scheduler', `⏰ 触发分项辅助规则 [云电脑挂机] (Cron: ${cron.cloudHangCron})...`, 'info');
         for (const acc of accounts) {
@@ -634,8 +647,8 @@ class TaskScheduler {
     }
 
     // 2.3b 浏览器真挂机分项规则（每天 3:00，挂 61 分钟）
-    if (cron.browserHangCron?.trim()) {
-      if (shouldRunCron(cron.browserHangCron.trim(), bj)) {
+    if (cronExprText(cron, 'browserHangCron')) {
+      if (shouldRunCron(cronExprText(cron, 'browserHangCron'), bj)) {
         // 命中分支必须登记分钟标记（旧实现唯独此分支漏记，同一分钟内 30 秒巡检
         // 会二次启动 61 分钟浏览器挂机，与其他账号共享 profile 时还会互踩 —— 新发现 S4）
         this.lastTriggerMinute = currentMinKey;
@@ -663,8 +676,8 @@ class TaskScheduler {
     }
 
     // 2.4 自动兑换与抽奖分项规则
-    if (cron.redeemCron?.trim()) {
-      if (shouldRunCron(cron.redeemCron.trim(), bj)) {
+    if (cronExprText(cron, 'redeemCron')) {
+      if (shouldRunCron(cronExprText(cron, 'redeemCron'), bj)) {
         this.lastTriggerMinute = currentMinKey;
         this.appendLog('Scheduler', `⏰ 触发分项辅助规则 [自动兑换/抽奖] (Cron: ${cron.redeemCron})...`, 'info');
         for (const acc of accounts) {
