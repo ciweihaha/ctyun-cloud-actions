@@ -20,11 +20,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      # G10: actions pinned to full commit SHA of the v4 tags
+      # G10: actions pinned to full commit SHA of the v7 tags
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '22'
+          node-version: '26'
       # G10: reproducible install from lockfile (was: npm install --production)
       - run: npm ci --omit=dev
       # G10: test gate - unit tests must pass before real tasks run
