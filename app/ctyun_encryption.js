@@ -6,6 +6,11 @@ class CtYunEncryption {
   }
 
   execute(data) {
+    // REDQ 报文最小长度：16 字节头 + 166 字节 RSA 公钥区（N 在 32..161，E 在 163..166）。
+    // 过短报文此前会在 BigInt('0x' + '') 抛晦涩的 SyntaxError，此处先明说。
+    if (!Buffer.isBuffer(data) || data.length < 182) {
+      throw new Error(`REDQ 报文过短（${Buffer.isBuffer(data) ? data.length + 'B' : '非 Buffer'}，需 ≥182B），无法解析 RSA 公钥`);
+    }
     const inbound = data.subarray(16);
     // 提取 N (129 字节，从 32 开始)
     const nBuf = inbound.subarray(32, 32 + 129);

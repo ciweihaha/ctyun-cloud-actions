@@ -3,7 +3,6 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const net = require('net');
 const dns = require('dns');
 
 // 全局优先使用 IPv4，彻底根治 Docker 容器及宿主机双栈网络下因 IPv6 无外网网关导致的 10 秒超时假死

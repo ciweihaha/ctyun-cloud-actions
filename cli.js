@@ -14,7 +14,6 @@
 //
 // 注意：本文件只做了 node --check 语法检查与代码走读，真实登录未实测（无凭证）。
 
-const crypto = require('crypto');
 const { CtYunClient } = require('./server.js');
 const { executeNativeSign, executeNativeAiChat, executeNativeHang } = require('./app/tasks/native_tasks.js');
 
@@ -24,10 +23,6 @@ const CHALLENGE_URL = 'https://desk.ctyun.cn:8810/api/auth/client/genChallengeDa
 const onLog = (tag, msg, level = 'info') => {
   console.log(`[${new Date().toISOString()}][${tag}][${level}] ${msg}`);
 };
-
-function sha256(t) {
-  return crypto.createHash('sha256').update(t).digest('hex').toLowerCase();
-}
 
 function genDeviceCode() {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
@@ -87,21 +82,6 @@ async function loginWithPassword(client, acc, onLog) {
     return { success: false, error: `获取 challenge 失败: HTTP ${chal.http} ${chal.json ? (chal.json.msg || '') : (chal.raw || '')}` };
   }
   const { challengeCode, challengeId } = chal.json.data;
-
-  const body = new URLSearchParams({
-    userAccount: acc.user,
-    password: acc.password,
-    sha256Password: sha256(sha256(acc.password) + challengeCode),
-    challengeId: String(challengeId || ''),
-    captchaCode: '',
-    deviceCode,
-    deviceName: 'Chrome浏览器',
-    deviceType: '60',
-    deviceModel: 'Windows NT 10.0; Win64; x64',
-    appVersion: '3.2.0',
-    sysVersion: 'Windows NT 10.0; Win64; x64',
-    clientVersion: '103020001',
-  });
 
   onLog('Login', `正在用账号密码登录 (${mask(acc.user)})...`, 'info');
   // 直接复用 dashboard 的真实实现（server.js loginWithCaptcha），captchaCode 传空——
