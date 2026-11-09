@@ -347,10 +347,24 @@ async function executeNativeAiChat(client, acc, onLog = console.log) {
   // 假成功。现区分三路：业务错误重抛；解析失败抛错；其余才算成功。
   // 注意：积分本身仍由后续 refreshOfficialTasks 复核，本处只保证
   // “响应不可解析”不再被说成成功，不改动积分口径。
+  // 2026-11-08 修：eaichat 即使 stream:false 也回 SSE 流式体
+  // （`data:{...}`，可能多行并以 data:[DONE] 收尾），直接
+  // JSON.parse 必失败。先剥 SSE 帧再解析，纯 JSON 原样兼容。
+  // 依次尝试：最后一段 data 帧（telechat 单帧即完整体）→ 全部帧
+  // 拼接 → 原文；都失败才按原口径抛“返回非 JSON”。
+  const ssePayloads = String(resText).split(/\r?\n/).map((l) => l.trim())
+    .filter((l) => l.startsWith('data:'))
+    .map((l) => l.slice(5).trim())
+    .filter((p) => p && p !== '[DONE]');
+  const jsonCandidates = ssePayloads.length
+    ? [ssePayloads[ssePayloads.length - 1], ssePayloads.join(''), String(resText).trim()]
+    : [String(resText).trim()];
   let chatJson;
-  try {
-    chatJson = JSON.parse(resText);
-  } catch (e) {
+  let parsed = false;
+  for (const candidate of jsonCandidates) {
+    try { chatJson = JSON.parse(candidate); parsed = true; break; } catch (e) { /* 试下一个候选 */ }
+  }
+  if (!parsed) {
     throw new Error(`AI 对话返回非 JSON，无法确认业务结果: ${String(resText).slice(0, 200)}`);
   }
   if (chatJson.code && chatJson.code !== 0 && chatJson.code !== 200) {
