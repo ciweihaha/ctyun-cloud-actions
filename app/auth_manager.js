@@ -242,7 +242,14 @@ class AuthManager {
       return { success: false, error: policyError };
     }
 
-    const defaultQuota = cfg.settings?.defaultQuota || 2;
+    // 深查第 6 轮：入口校验（settings_validation.js）拦不住手工改配置文件
+    // 落盘的毒值（"abc" 使配额门恒假、-5 使新用户一台都加不了），注册时再
+    // 钳制一次：非整数回落默认 2，整数钳制到 1–999（与入口同一口径）。
+    // 合法值（1–999 的整数或等值数字字符串）行为不变。
+    const parsedQuota = parseInt(cfg.settings?.defaultQuota, 10);
+    const defaultQuota = Number.isInteger(parsedQuota)
+      ? Math.min(999, Math.max(1, parsedQuota))
+      : 2;
     const newUser = {
       id: 'u_' + crypto.randomUUID().substring(0, 8),
       username: cleanUser,
