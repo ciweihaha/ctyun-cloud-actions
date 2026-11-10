@@ -38,6 +38,9 @@
  * sanitizeSettingsForRestore，供备份还原路径复用同一口径做“丢弃式”清洗。
  * 深查第 5 轮补记：cron 子项（enableSubCron 与 5 个分项表达式）纳入类型校验——
  * 非字符串表达式会使调度器 `?.trim()` 读值抛 TypeError，见 scheduler.js cronExprText。
+ * 深查第 6 轮补记：defaultQuota 纳入整数校验（1–999 台）——非数值真值会
+ * 原样成为新用户 maxQuota，配额门 `owned >= maxQuota` 对 "abc" 恒假（无限
+ * 加账号）、对 -5 恒真（一台都加不了）；见 auth_manager.js register。
  *
  * @param {object} body - PUT /api/settings 的 JSON 体
  * @returns {{ok:true, normalized:object}|{ok:false, error:string}}
@@ -53,6 +56,14 @@ const PULSE_MAX = 3300;
 // 深查第 4 轮：pulseIntervalMinutes 旧字段（仅 server.js:6605 还原日志行引用，
 // 无任何消费点读它）。合法旧备份里的值是分钟数，45 分钟即默认显示值；
 // 折算成秒须落在 pulseIntervalSeconds 的 10–3300 秒窗口内，故取 1–55 分钟。
+// 深查第 6 轮：普通用户默认配额（新用户注册时 maxQuota 的取值）。
+// 下限 1：0 / 负数会让新注册用户一台云电脑都加不了（配额门 `owned >= maxQuota`
+// 在 0 台时即恒真；0 本身因 `|| 2` 兜底无害，但入口仍按 keepAliveSeconds
+// 拒 0 的既有口径拒绝，错误信息直接告诉管理员合法范围）。
+// 上限 999：与管理员自身的 maxQuota 999（auth_manager.js 初始管理员）一致，
+// 是仓内唯一的配额上限证据；默认值高于管理员自己的配额没有意义。
+const DEFAULT_QUOTA_MIN = 1;
+const DEFAULT_QUOTA_MAX = 999;
 const PULSE_MINUTES_MIN = 1;
 const PULSE_MINUTES_MAX = 55;
 // 深查第 5 轮：分项 Cron 表达式字段（scheduler.js 的 hasActiveSubCronRules /
@@ -131,6 +142,19 @@ function validateSettingsUpdate(body) {
       return { ok: false, error: `脉冲间隔 pulseIntervalMinutes 须为 ${PULSE_MINUTES_MIN}–${PULSE_MINUTES_MAX} 的整数分钟（旧字段）` };
     }
     normalized.pulseIntervalMinutes = r.value;
+  }
+
+  // 深查第 6 轮：普通用户默认配额。未校验时 "abc" / -5 / 1000 均可落盘：
+  // 注册时 `defaultQuota || 2` 只救 falsy 值，"abc" 原样成为新用户 maxQuota，
+  // 配额门 `owned >= "abc"` 恒假（NaN 比较），该用户可无限加账号；-5 则
+  // `0 >= -5` 恒真，新用户一台都加不了。单用户改配额 updateUserQuota
+  // 已有 `parseInt(...) || 2` 守卫，唯独全局默认值无校验，属口径遗漏。
+  if (!isAbsent(body.defaultQuota)) {
+    const r = asIntegerInRange(body.defaultQuota, DEFAULT_QUOTA_MIN, DEFAULT_QUOTA_MAX);
+    if (!r.ok) {
+      return { ok: false, error: `默认配额 defaultQuota 须为 ${DEFAULT_QUOTA_MIN}–${DEFAULT_QUOTA_MAX} 的整数台` };
+    }
+    normalized.defaultQuota = r.value;
   }
 
   // 深查第 4 轮：cron 本身为非对象时直接拒绝。此前只在 cron 为对象时校验
@@ -212,6 +236,8 @@ function sanitizeSettingsForRestore(imported, current) {
   checkIntegerField('keepAliveSeconds', KEEP_ALIVE_MIN, KEEP_ALIVE_MAX);
   checkIntegerField('pulseIntervalSeconds', PULSE_MIN, PULSE_MAX);
   checkIntegerField('pulseIntervalMinutes', PULSE_MINUTES_MIN, PULSE_MINUTES_MAX);
+  // 深查第 6 轮：与 PUT 同口径，毒 defaultQuota 只丢弃、不整单拒绝。
+  checkIntegerField('defaultQuota', DEFAULT_QUOTA_MIN, DEFAULT_QUOTA_MAX);
 
   if ('cron' in sanitized) {
     const c = sanitized.cron;
@@ -272,5 +298,7 @@ module.exports = {
   PULSE_MAX,
   PULSE_MINUTES_MIN,
   PULSE_MINUTES_MAX,
+  DEFAULT_QUOTA_MIN,
+  DEFAULT_QUOTA_MAX,
   SUB_CRON_FIELDS,
 };
