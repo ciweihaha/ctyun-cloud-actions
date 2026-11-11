@@ -5912,7 +5912,9 @@ function rewardNeedsDesktop(prodId, prodType) {
           });
           const orderData = await orderRes.json();
 
-          if (orderData.code === 0) {
+          // 深查第 16 轮：与自动兑换 S11（app/tasks/redeem_order.js）同口径——
+          // 字符串成功码同义；网络/解析异常属结果不明确（见下方 catch），绝不重试。
+          if (normalizeBusinessCode(orderData.code) === 0) {
             success = true;
             appendLog('Redeem', `[${acc.name}] ✅ 成功一次性完成【${prodName}】x${times} 兑换，共扣除 ${totalCost} 积分！`, 'success');
             break;
@@ -5940,8 +5942,12 @@ function rewardNeedsDesktop(prodId, prodType) {
 
           appendLog('Redeem', `[${acc.name}] 第 ${attempt} 次下单未成功: ${lastError}`, 'warning');
         } catch (e) {
-          lastError = e.message;
-          appendLog('Redeem', `[${acc.name}] 第 ${attempt} 次网络异常: ${lastError}`, 'warning');
+          // 结果不明确：fetch 抛错或响应体解析失败均属此类，服务端可能已受理订单；
+          // 绝不盲目重试（旧实现与业务失败一视同仁重试 3 次，存在「已受理但响应
+          // 丢失 → 重复扣积分」风险，与自动兑换 S11 修复前同一缺陷）。
+          lastError = `网络异常，结果不明确（可能已受理）: ${e.message}`;
+          appendLog('Redeem', `[${acc.name}] 下单结果不明确，已停止重试以防重复扣积分: ${e.message}`, 'error');
+          break;
         }
       }
 
