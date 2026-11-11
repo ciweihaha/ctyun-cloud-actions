@@ -2030,10 +2030,10 @@ class CtYunClient {
       const statusUrl = `https://desk.ctyun.cn:8810/api/desktop/client/status?desktopId=${encodeURIComponent(dIdStr)}&specifiedCertCategory=1`;
       const sRes = await fetchWithTimeout(statusUrl, { headers: this.getSignedHeaders() });
       const sJson = await sRes.json();
-      if (sJson.code === 0 && sJson.data?.desktopInfo?.clinkLvsOutHost) {
+      if (normalizeBusinessCode(sJson.code) === 0 && sJson.data?.desktopInfo?.clinkLvsOutHost) {
         return sJson.data.desktopInfo;
       }
-      if (sJson.code === 40010 || String(sJson.msg || '').includes('登录信息已过期') || String(sJson.msg || '').includes('会话已过期')) {
+      if (normalizeBusinessCode(sJson.code) === 40010 || String(sJson.msg || '').includes('登录信息已过期') || String(sJson.msg || '').includes('会话已过期')) {
         await this.renewToken().catch(() => {});
       }
     } catch (e) {}
@@ -2064,11 +2064,11 @@ class CtYunClient {
       body: connBody.toString()
     });
     const json = await res.json();
-    if (json.code === 0) {
+    if (normalizeBusinessCode(json.code) === 0) {
       // 若云电脑已关机，服务端返回 desktopInfo 为 null 且带有 goingRetry: true
       return json.data?.desktopInfo || null;
     }
-    if (json.code === 40010 || String(json.msg || '').includes('登录信息已过期') || String(json.msg || '').includes('会话已过期')) {
+    if (normalizeBusinessCode(json.code) === 40010 || String(json.msg || '').includes('登录信息已过期') || String(json.msg || '').includes('会话已过期')) {
       await this.renewToken().catch(() => {});
     }
     throw new Error(json.msg || '获取云电脑连接配置失败');
