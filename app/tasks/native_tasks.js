@@ -168,6 +168,21 @@ function normalizeBusinessCode(code) {
 }
 
 /**
+ * SSO 票据换取是否成功（深查第 9 轮，与第 7/8 轮同类问题）：
+ * eaichat 同系接口存在数字/字符串两种码型；旧实现 `resultCode !== 0`
+ * 只认数字，`{resultCode:"0"}` 会被误判鉴权失败，AI 问答在第 3 步
+ * 即夭折（连对话请求都发不出去）。数字与等值数字字符串同义；
+ * 缺失/非数字/非 0 码仍判失败，与旧实现一致。另：旧实现在 authJson
+ * 为 null 时读 .resultCode 抛 TypeError，现统一走本函数判失败，
+ * 调用方按原口径抛“鉴权换取失败”。
+ */
+function isSsoAuthSuccess(authJson) {
+  if (!authJson || typeof authJson !== 'object') return false;
+  if (normalizeBusinessCode(authJson.resultCode) !== 0) return false;
+  return !!authJson.data?.sessionKey;
+}
+
+/**
  * 解析 AI 对话响应体（从 executeNativeAiChat 抽出以便单测）。
  * 深查第 1 轮：旧 try/catch 只重抛业务错误，非 JSON 响应（如错误页、
  * 被截断的体）导致 JSON.parse 抛 SyntaxError 时会被吞掉，随后仍
@@ -335,8 +350,8 @@ async function executeNativeAiChat(client, acc, onLog = console.log) {
   }, onLog); }, onLog);
 
   const authJson = await authPostRes.json();
-  if (authJson.resultCode !== 0 || !authJson.data?.sessionKey) {
-    throw new Error('SSO Ticket 鉴权换取失败: ' + (authJson.resultMsg || JSON.stringify(authJson)));
+  if (!isSsoAuthSuccess(authJson)) {
+    throw new Error('SSO Ticket 鉴权换取失败: ' + ((authJson && authJson.resultMsg) || JSON.stringify(authJson)));
   }
 
   let rawCookies = '';
@@ -609,5 +624,6 @@ module.exports = {
   executeNativeAiChat,
   executeNativeSign,
   executeNativeHang,
-  parseAiChatResponse
+  parseAiChatResponse,
+  isSsoAuthSuccess
 };
