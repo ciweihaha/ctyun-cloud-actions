@@ -16,6 +16,10 @@
 
 const { CtYunClient } = require('./server.js');
 const { executeNativeSign, executeNativeAiChat, executeNativeHang } = require('./app/tasks/native_tasks.js');
+// 深查第 12 轮：challenge 响应码用 task_center 的归一化判定（数字/字符串同义）。
+// 旧实现 `chal.json.code !== 0` 只认数字，challenge 回 `{code:"0"}` 时整班
+// 每日任务在登录第一步即 exit 1，签到/AI/挂机一个都跑不起来。
+const { normalizeBusinessCode } = require('./app/task_center');
 
 const LOGIN_URL = 'https://desk.ctyun.cn:8810/api/auth/client/login';
 const CHALLENGE_URL = 'https://desk.ctyun.cn:8810/api/auth/client/genChallengeData';
@@ -78,7 +82,7 @@ async function loginWithPassword(client, acc, onLog) {
     headers: { ...headers, 'Content-Type': 'application/json' },
     body: '{}',
   });
-  if (!chal.json || chal.json.code !== 0 || !chal.json.data) {
+  if (!chal.json || normalizeBusinessCode(chal.json.code) !== 0 || !chal.json.data) {
     return { success: false, error: `获取 challenge 失败: HTTP ${chal.http} ${chal.json ? (chal.json.msg || '') : (chal.raw || '')}` };
   }
   const { challengeCode, challengeId } = chal.json.data;
