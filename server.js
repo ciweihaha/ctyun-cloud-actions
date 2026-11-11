@@ -2124,7 +2124,7 @@ class CtYunClient {
       // 1. 尝试主信令 (1 或 18)
       try {
         const data1 = await sendOperate(opType);
-        if (data1.code === 0) {
+        if (normalizeBusinessCode(data1.code) === 0) {
           appendLog('System', `[${accName}] ✅ 云电脑【${actionCn}】指令已成功生效！`, 'success');
           return { success: true, message: `云电脑【${actionCn}】指令已成功下发！官方已确认启动。` };
         }
@@ -2138,7 +2138,7 @@ class CtYunClient {
       const altCn = (altOpType === 18) ? '唤醒' : '开机';
       try {
         const data2 = await sendOperate(altOpType);
-        if (data2.code === 0) {
+        if (normalizeBusinessCode(data2.code) === 0) {
           appendLog('System', `[${accName}] ✅ 云电脑【${altCn}】互补指令已成功生效！`, 'success');
           return { success: true, message: `云电脑【${altCn}】指令已成功下发！官方已确认启动。` };
         }
@@ -2171,7 +2171,7 @@ class CtYunClient {
           body: connBody.toString()
         });
         const connData = await connRes.json();
-        if (connData.code === 0 && connData.data?.goingRetry) {
+        if (normalizeBusinessCode(connData.code) === 0 && connData.data?.goingRetry) {
           appendLog('System', `[${accName}] ✅ 云电脑通用启动信令已触发 (goingRetry: true)，云端正在开机...`, 'success');
           return { success: true, message: '云电脑开机信令已同步触发，云端正在启动中！' };
         }
@@ -2190,7 +2190,7 @@ class CtYunClient {
     // 关机 / 重启
     try {
       const data = await sendOperate(opType);
-      if (data.code === 0) {
+      if (normalizeBusinessCode(data.code) === 0) {
         appendLog('System', `[${accName}] ✅ 云电脑【${actionCn}】指令已成功生效！官方返回: 成功`, 'success');
         sendAccountNotification(
           this.account,
