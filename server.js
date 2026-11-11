@@ -1943,7 +1943,7 @@ class CtYunClient {
           })
         });
         const json = await res.json();
-        if (json.code === 0 && json.data) {
+        if (normalizeBusinessCode(json.code) === 0 && json.data) {
           const list1 = CtYunClient.parseAllDesktops(json.data);
           for (const d of list1) {
             const id = String(d.desktopId || d.objId || '');
@@ -1952,7 +1952,7 @@ class CtYunClient {
               mergedList.push(d);
             }
           }
-        } else if (json.code === 40010 || String(json.msg || '').includes('登录信息已过期') || String(json.msg || '').includes('会话已过期')) {
+        } else if (normalizeBusinessCode(json.code) === 40010 || String(json.msg || '').includes('登录信息已过期') || String(json.msg || '').includes('会话已过期')) {
           isAuthExpired = true;
         }
       } catch (e) {}
@@ -1964,7 +1964,7 @@ class CtYunClient {
           headers: this.getSignedHeaders()
         });
         const jsonList = await resList.json();
-        if (jsonList.code === 0 && jsonList.data) {
+        if (normalizeBusinessCode(jsonList.code) === 0 && jsonList.data) {
           const list2 = CtYunClient.parseAllDesktops(jsonList.data);
           for (const d of list2) {
             const id = String(d.desktopId || d.objId || '');
@@ -1973,7 +1973,7 @@ class CtYunClient {
               mergedList.push(d);
             }
           }
-        } else if (jsonList.code === 40010 || String(jsonList.msg || '').includes('登录信息已过期') || String(jsonList.msg || '').includes('会话已过期')) {
+        } else if (normalizeBusinessCode(jsonList.code) === 40010 || String(jsonList.msg || '').includes('登录信息已过期') || String(jsonList.msg || '').includes('会话已过期')) {
           isAuthExpired = true;
         }
       } catch (e) {}
