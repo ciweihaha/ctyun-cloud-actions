@@ -879,8 +879,18 @@ async function keepaliveRawSpiceLoop(mainLink, opts = {}) {
  * 字节流弄脏了，同一 socket 重试必然失败。所以降级实现为**整条重新拨号**
  * （见 dialCagTcpTls），本函数只负责"这一次要严格还是要放宽"。
  */
-function upgradeToTls(socket, { host, allowInsecure, onLog }) {
+function upgradeToTls(socket, { host, allowInsecure, onLog, timeoutMs = 15000 }) {
   return new Promise((resolve, reject) => {
+    // 深查第 25 轮：此前 TLS 握手没有任何超时——dialCagTcpTlsOnce 的计时器在升级前
+    // 就被清掉，握手一旦被网关静默挂起，调用方会永远卡在 await 上：失败计数不涨、
+    // 控制面持续被抑制（2026-09-26“假活跃”的同类形态），且 stop 也中断不了它。
+    // 握手超时即销毁 socket 并拒绝，让上层按失败重试。
+    let settled = false;
+    const done = (fn, val) => { if (!settled) { settled = true; fn(val); } };
+    const timer = setTimeout(() => {
+      try { socket.destroy(); } catch (e) { /* 已断开 */ }
+      done(reject, new Error(`TLS 握手超时（${timeoutMs}ms，未收到服务端响应）：${host}`));
+    }, timeoutMs);
     const options = {
       socket,
       servername: undefined,       // 内网 IP 端点，无 SNI 可用
@@ -890,12 +900,13 @@ function upgradeToTls(socket, { host, allowInsecure, onLog }) {
       // 仅由受控降级路径传入 true；严格路径下这一行不会被执行。
       options.rejectUnauthorized = false;
     }
-    const stream = tls.connect(options, () => resolve(stream));
+    const stream = tls.connect(options, () => { clearTimeout(timer); done(resolve, stream); });
     stream.once('error', (err) => {
+      clearTimeout(timer);
       if (typeof onLog === 'function' && allowInsecure === false) {
         onLog(`TLS 握手失败（${host}）：${(err && err.code) || (err && err.message) || err}`, 'warning');
       }
-      reject(err);
+      done(reject, err);
     });
   });
 }
@@ -979,7 +990,7 @@ function dialCagTcpTlsOnce(opts, allowInsecure) {
       sock.setTimeout(0);
       log(`auth 通过（conv=${conv}），升级 TLS（${allowInsecure ? '受控降级：已放宽校验' : '严格校验先行'}）`);
 
-      upgradeToTls(sock, { host: outerHost, allowInsecure, onLog: opts.onLog })
+      upgradeToTls(sock, { host: outerHost, allowInsecure, onLog: opts.onLog, timeoutMs })
         .then((stream) => done(resolve, { socket: stream, conv }))
         .catch((err) => {
           try { sock.destroy(); } catch (e) { /* 已断开 */ }
