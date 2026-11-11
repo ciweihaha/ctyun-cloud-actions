@@ -2330,7 +2330,9 @@ class CtYunClient {
     });
     const data = await res.json();
     const rewards = [];
-    if (data && data.data) {
+    // 深查第 19 轮：上游异常体可能回 data 为对象/字符串等非数组，直接 for...of 会抛
+    // TypeError 导致商城查询 500；非数组一律按空列表处理。
+    if (data && Array.isArray(data.data)) {
       for (const mall of data.data) {
         for (const series of (mall.series || [])) {
           for (const sku of (series.sku || [])) {
