@@ -1770,7 +1770,7 @@ class CtYunClient {
       }
     });
     const json = await res.json();
-    if (json.code !== 0 || !json.data?.qrCodeId) {
+    if (normalizeBusinessCode(json.code) !== 0 || !json.data?.qrCodeId) {
       throw new Error(json.msg || '获取二维码失败');
     }
     const qrCodeId = json.data.qrCodeId;
@@ -1797,7 +1797,7 @@ class CtYunClient {
       }
     });
     const json = await res.json();
-    if (json.code !== 0 || !json.data) {
+    if (normalizeBusinessCode(json.code) !== 0 || !json.data) {
       throw new Error(json.msg || '查询扫码状态失败');
     }
     return {
