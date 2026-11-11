@@ -35,7 +35,7 @@ const requestContext = new AsyncLocalStorage();
 const CORS_ALLOWED_ORIGINS = parseAllowedOrigins(process.env.CTYUN_CORS_ORIGINS);
 const { TaskScheduler } = require('./app/tasks/scheduler');
 const { validateSettingsUpdate, sanitizeSettingsForRestore } = require('./app/settings_validation');
-const { isTaskCenterExpired, isTaskListOk, isPointsOk } = require('./app/task_center');
+const { isTaskCenterExpired, isTaskListOk, isPointsOk, normalizeBusinessCode } = require('./app/task_center');
 const { SohoClient } = require('./app/ydpc/soho_client');
 const { performCagAuthHold } = require('./app/ydpc/cag_client');
 const { YdpcClient } = require('./app/ydpc/ydpc_client');
@@ -1483,7 +1483,7 @@ class CtYunClient {
     });
 
     const result = await loginRes.json();
-    if (result.code === 0 && result.data) {
+    if (normalizeBusinessCode(result.code) === 0 && result.data) {
       this.loginInfo = result.data;
       this.account.savedLoginInfo = result.data;
       this.account.bound = !!result.data.bondedDevice;
@@ -1513,7 +1513,7 @@ class CtYunClient {
         body: JSON.stringify({ authAppModel: 34, effectiveSeconds })
       });
       const json = await res.json();
-      if (json.code === 0 && json.data?.token) {
+      if (normalizeBusinessCode(json.code) === 0 && json.data?.token) {
         return json.data.token;
       }
       lastErr = `${json.msg || '获取免密 Token 失败'} (Code: ${json.code})`;
@@ -1839,7 +1839,8 @@ class CtYunClient {
       })
     });
     const json = await res.json();
-    if (json.code !== 0 && json.code !== 200) {
+    const loginCode = normalizeBusinessCode(json.code);
+    if (loginCode !== 0 && loginCode !== 200) {
       throw new Error(`${json.msg || '登录验证失败'} (Code: ${json.code})`);
     }
     this.loginInfo = json.data;
