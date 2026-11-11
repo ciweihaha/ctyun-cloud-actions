@@ -257,7 +257,9 @@ class SohoClient {
   }
 
   async getLoginPublicKey() {
-    const res = await this.fetchApi('/login/publicKey/v1', { type: 1 });
+    // 深查第 20 轮：login() 内部调用不得触发自动重登——否则网关对登录接口回 4001
+    // 时 fetchApi 会重入 login() 形成无限递归（栈溢出 + 登录请求风暴）。
+    const res = await this.fetchApi('/login/publicKey/v1', { type: 1 }, 'POST', true);
     if (res.code !== 2000 || !res.data) {
       throw new Error(`获取登录公钥失败: ${res.msg || JSON.stringify(res)}`);
     }
@@ -292,7 +294,7 @@ class SohoClient {
         password: encPwd,
         verificationCode: String(verificationCode || ''),
         randomCode: String(randomCode || '')
-      });
+      }, 'POST', true);
       if (subRes.code === 2000 && subRes.data) {
         this.userId = String(subRes.data.userId);
         this.sohoToken = subRes.data.sohoToken;
@@ -308,7 +310,7 @@ class SohoClient {
       password: encPwd,
       verificationCode: String(verificationCode || ''),
       randomCode: String(randomCode || '')
-    });
+    }, 'POST', true);
 
     if (mainRes.code === 2000 && mainRes.data) {
       this.userId = String(mainRes.data.userId);
@@ -326,7 +328,7 @@ class SohoClient {
           password: encPwd,
           verificationCode: String(verificationCode || ''),
           randomCode: String(randomCode || '')
-        });
+        }, 'POST', true);
         if (subFallback.code === 2000 && subFallback.data) {
           this.userId = String(subFallback.data.userId);
           this.sohoToken = subFallback.data.sohoToken;
