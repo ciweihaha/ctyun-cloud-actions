@@ -156,8 +156,18 @@ class YdpcClient {
       // 状态整体搬回来（其中就包含旧的 `_route` / `vendor`），若不重新写一遍，
       // 「强制重探」得到的新结论会被旧结论原地覆盖 —— 探了等于没探。
       const freshProbe = new Map();
+      // 深查第 22 轮：探测失败且底座未明的机器（下轮重探）——差量合并会把旧
+      // vendorProbeStale 搬回来盖掉刚写的 true，需在合并后重新标记，见下方。
+      const staleProbeFailed = new Set();
+      // 深查第 22 轮（根因）：needProbe 原先读的是 listCloudPcs 刚返回的新对象
+      // （永无 vendor），故恒为 true —— 底座探测每轮必跑，注释的“判定后跳过探测”
+      // 从未生效（2026-09-26 注释“vendor 还在 ⇒ needProbe=false”的假设亦不成立）。
+      // 改为读上一轮已持久化的旧对象：有确定 vendor 且未标记 stale 才跳过探测；
+      // 旧对象不存在（新机）或已标记 stale（上轮探测失败）时才重探。
+      const oldVmsMap = new Map((this.account.vms || []).map(v => [String(v.userServiceId), v]));
       for (const vm of vms) {
-        const needProbe = !vm.vendor || vm.vendorProbeStale === true;
+        const oldVm = oldVmsMap.get(String(vm.userServiceId));
+        const needProbe = !oldVm?.vendor || oldVm?.vendorProbeStale === true;
         if (needProbe) {
           let auth = null;
           let probeErr = '';
@@ -185,6 +195,7 @@ class YdpcClient {
             // 否则一次瞬时网络故障会把"底座未知"固化进 vendor（vendor 一旦有值就不再重探），
             // 继而被动闸门永久拒绝保活 —— 必须避免这种自我封锁。
             vm.vendorProbeStale = true;
+            staleProbeFailed.add(String(vm.userServiceId));
             continue;
           }
 
@@ -223,7 +234,7 @@ class YdpcClient {
       }
 
       // 差量合并引擎 (Diff-Merge)：严格保留本地已有的单机独立保活与独立周期设置
-      const oldVmsMap = new Map((this.account.vms || []).map(v => [String(v.userServiceId), v]));
+      // （oldVmsMap 已在上方探测循环前建好，此处复用，同一轮内 account.vms 未变）
       for (const vm of vms) {
         const old = oldVmsMap.get(String(vm.userServiceId));
         if (old) {
@@ -282,6 +293,13 @@ class YdpcClient {
           vm.vendorProbedAt = fresh.vendorProbedAt;
           vm.vendorProbeStale = false;
           continue;
+        }
+        // 深查第 22 轮：探测失败且底座未明的机器，差量合并已把旧 vendorProbeStale
+        // （通常 false）搬回来，盖掉了探测循环里刚写的 true —— 注释承诺的“下轮重探”
+        // 永远不发生，旧底座结论一旦有误就再也纠正不了。在此重新标记为 stale，下轮重探。
+        // 注意不 continue：下方的持久化 vendor 重建仍要执行，闸门在重探前仍有路由可用。
+        if (staleProbeFailed.has(String(vm.userServiceId))) {
+          vm.vendorProbeStale = true;
         }
         if (!vm._route && vm.vendor) {
           const rebuilt = resolveVmRoute(vm, null);
