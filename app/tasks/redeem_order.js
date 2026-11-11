@@ -14,6 +14,24 @@
 const FATAL_MARKERS = ['积分不足', '点数不足', '余额不足', '风控', '频繁', '异常操作', '超过最大', '上限'];
 const RISK_MARKERS = ['风控', '频繁', '异常操作'];
 
+/**
+ * 归一化业务码（深查第 7 轮）：天翼云同系接口存在数字/字符串两种码型——
+ * native_tasks.js 的 getTicket 分支已显式兼容 `40010` 与 `'40010'` 两种写法，
+ * 证明上游确会回字符串码；而此处旧实现只认数字 `code === 0`。
+ * 若 placeOrder 回 `{code: '0'}`，旧实现会把一次已成功的下单误判为业务失败，
+ * 进而按“明确业务错误可重试”再下单 2 次——服务端已受理的订单可能被重复
+ * 下单、重复扣积分。新口径：数字与等值数字字符串同义；非数字字符串、
+ * null/undefined 保持原行为（不视为成功），避免把未知码型误判为成功。
+ */
+function normalizeCode(code) {
+  if (typeof code === 'number') return code;
+  if (typeof code === 'string' && code.trim() !== '') {
+    const n = Number(code.trim());
+    if (Number.isFinite(n)) return n;
+  }
+  return code;
+}
+
 function isFatalBusinessError(msg) {
   return FATAL_MARKERS.some(m => String(msg || '').includes(m));
 }
@@ -57,7 +75,7 @@ async function attemptRedeemOrder(opts) {
       // 结果不明确：可能已受理。绝不重试。
       return { status: 'unknown', msg: `网络异常，结果不明确（可能已受理）: ${(e && e.message) || e}`, attempts: attempt };
     }
-    if (data && data.code === 0) {
+    if (data && normalizeCode(data.code) === 0) {
       return { status: 'success', msg: 'OK', attempts: attempt };
     }
     lastMsg = (data && data.msg) || `错误码 ${data && data.code}`;
@@ -73,4 +91,4 @@ async function attemptRedeemOrder(opts) {
   return { status: 'failed', msg: lastMsg, attempts: maxAttempts };
 }
 
-module.exports = { attemptRedeemOrder, isFatalBusinessError, isRiskBusinessError };
+module.exports = { attemptRedeemOrder, isFatalBusinessError, isRiskBusinessError, normalizeCode };
