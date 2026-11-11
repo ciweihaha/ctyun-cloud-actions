@@ -153,6 +153,69 @@ async function withRetry(stepLabel, fn, onLog = console.log, delays = [5000, 150
 }
 
 /**
+ * 归一化业务码（深查第 8 轮，与 redeem_order.js 第 7 轮同类问题）：
+ * 天翼云同系接口存在数字/字符串两种码型（getTicket 分支已兼容
+ * 40010/'40010'）；数字与等值数字字符串同义，非数字字符串/布尔等
+ * 原样返回，调用方仍按“非 0/200 即错误”处理，绝不把未知码型当成功。
+ */
+function normalizeBusinessCode(code) {
+  if (typeof code === 'number') return code;
+  if (typeof code === 'string' && code.trim() !== '') {
+    const n = Number(code.trim());
+    if (Number.isFinite(n)) return n;
+  }
+  return code;
+}
+
+/**
+ * 解析 AI 对话响应体（从 executeNativeAiChat 抽出以便单测）。
+ * 深查第 1 轮：旧 try/catch 只重抛业务错误，非 JSON 响应（如错误页、
+ * 被截断的体）导致 JSON.parse 抛 SyntaxError 时会被吞掉，随后仍
+ * 走到“✅ 成功、已获取 100 积分”日志并返回 success:true，属于
+ * 假成功。现区分三路：业务错误重抛；解析失败抛错；其余才算成功。
+ * 注意：积分本身仍由后续 refreshOfficialTasks 复核，本处只保证
+ * “响应不可解析”不再被说成成功，不改动积分口径。
+ * 2026-11-08 修：eaichat 即使 stream:false 也回 SSE 流式体
+ * （`data:{...}`，可能多行并以 data:[DONE] 收尾），直接
+ * JSON.parse 必失败。先剥 SSE 帧再解析，纯 JSON 原样兼容。
+ * 依次尝试：最后一段 data 帧（telechat 单帧即完整体）→ 全部帧
+ * 拼接 → 原文；都失败才按原口径抛“返回非 JSON”。
+ * 深查第 8 轮：业务码按 normalizeBusinessCode 归一化后判定——旧实现
+ * `code !== 0 && code !== 200` 只认数字，`{code:"0"}` 会被误判业务错误，
+ * 明明成功的对话被记失败、丢 100 积分；null 旧实现读 .code 抛 TypeError，
+ * 现按“返回非 JSON”抛错（null 不是可用业务结果）。
+ */
+function parseAiChatResponse(resText) {
+  const text = String(resText);
+  const ssePayloads = text.split(/\r?\n/).map((l) => l.trim())
+    .filter((l) => l.startsWith('data:'))
+    .map((l) => l.slice(5).trim())
+    .filter((p) => p && p !== '[DONE]');
+  const jsonCandidates = ssePayloads.length
+    ? [ssePayloads[ssePayloads.length - 1], ssePayloads.join(''), text.trim()]
+    : [text.trim()];
+  let chatJson;
+  let parsed = false;
+  for (const candidate of jsonCandidates) {
+    try { chatJson = JSON.parse(candidate); parsed = true; break; } catch (e) { /* 试下一个候选 */ }
+  }
+  if (!parsed) {
+    throw new Error(`AI 对话返回非 JSON，无法确认业务结果: ${text.slice(0, 200)}`);
+  }
+  if (chatJson === null) {
+    throw new Error(`AI 对话返回非 JSON，无法确认业务结果: ${text.slice(0, 200)}`);
+  }
+  const code = (typeof chatJson === 'object') ? chatJson.code : undefined;
+  if (code !== undefined && code !== null) {
+    const n = normalizeBusinessCode(code);
+    if (n !== 0 && n !== 200) {
+      throw new Error(`AI 对话业务返回错误: ${(typeof chatJson === 'object' && (chatJson.message || chatJson.msg)) || text}`);
+    }
+  }
+  return chatJson;
+}
+
+/**
  * 纯原生毫秒级 HTTP 协议直连执行天翼 AI 对话任务 (彻底剔除 Chromium/Puppeteer)
  */
 async function executeNativeAiChat(client, acc, onLog = console.log) {
@@ -341,35 +404,9 @@ async function executeNativeAiChat(client, acc, onLog = console.log) {
   }
 
   const resText = await chatRes.text();
-  // 深查第 1 轮：旧 try/catch 只重抛业务错误，非 JSON 响应（如错误页、
-  // 被截断的体）导致 JSON.parse 抛 SyntaxError 时会被吞掉，随后仍
-  // 走到“✅ 成功、已获取 100 积分”日志并返回 success:true，属于
-  // 假成功。现区分三路：业务错误重抛；解析失败抛错；其余才算成功。
-  // 注意：积分本身仍由后续 refreshOfficialTasks 复核，本处只保证
-  // “响应不可解析”不再被说成成功，不改动积分口径。
-  // 2026-11-08 修：eaichat 即使 stream:false 也回 SSE 流式体
-  // （`data:{...}`，可能多行并以 data:[DONE] 收尾），直接
-  // JSON.parse 必失败。先剥 SSE 帧再解析，纯 JSON 原样兼容。
-  // 依次尝试：最后一段 data 帧（telechat 单帧即完整体）→ 全部帧
-  // 拼接 → 原文；都失败才按原口径抛“返回非 JSON”。
-  const ssePayloads = String(resText).split(/\r?\n/).map((l) => l.trim())
-    .filter((l) => l.startsWith('data:'))
-    .map((l) => l.slice(5).trim())
-    .filter((p) => p && p !== '[DONE]');
-  const jsonCandidates = ssePayloads.length
-    ? [ssePayloads[ssePayloads.length - 1], ssePayloads.join(''), String(resText).trim()]
-    : [String(resText).trim()];
-  let chatJson;
-  let parsed = false;
-  for (const candidate of jsonCandidates) {
-    try { chatJson = JSON.parse(candidate); parsed = true; break; } catch (e) { /* 试下一个候选 */ }
-  }
-  if (!parsed) {
-    throw new Error(`AI 对话返回非 JSON，无法确认业务结果: ${String(resText).slice(0, 200)}`);
-  }
-  if (chatJson.code && chatJson.code !== 0 && chatJson.code !== 200) {
-    throw new Error(`AI 对话业务返回错误: ${chatJson.message || chatJson.msg || resText}`);
-  }
+  // 响应解析（含 SSE 剥帧与业务码归一化）见 parseAiChatResponse；
+  // 业务错误 / 非 JSON 一律抛错，绝不记假成功。
+  const chatJson = parseAiChatResponse(resText);
   onLog('AIChat', `✅ AI 对话成功完成！已获取今日 100 积分！(全流程耗时 ${Math.round((Date.now() - flowStartedAt) / 1000)}s)`, 'success');
   
   await client.refreshOfficialTasks();
@@ -571,5 +608,6 @@ async function executeNativeHang(client, acc, onLog = console.log) {
 module.exports = {
   executeNativeAiChat,
   executeNativeSign,
-  executeNativeHang
+  executeNativeHang,
+  parseAiChatResponse
 };
