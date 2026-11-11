@@ -5135,7 +5135,7 @@ function rewardNeedsDesktop(prodId, prodType) {
         body: '{}'
       });
       const chalData = await chalRes.json();
-      if (chalData.code !== 0) throw new Error(chalData.msg || '获取验证码挑战失败');
+      if (normalizeBusinessCode(chalData.code) !== 0) throw new Error(chalData.msg || '获取验证码挑战失败');
 
       const { challengeCode, challengeId } = chalData.data;
 
@@ -5417,7 +5417,8 @@ function rewardNeedsDesktop(prodId, prodType) {
       const resSms = await fetch(url, { headers: client.getSignedHeaders() });
       const dataSms = await resSms.json();
       const smsKey = resSms.headers.get('ctg-sms-key') || resSms.headers.get('CTG-SMS-KEY') || '';
-      if (dataSms.code === 0 || dataSms.code === 200) {
+      const smsCode = normalizeBusinessCode(dataSms.code);
+      if (smsCode === 0 || smsCode === 200) {
         if (smsKey) {
           acc._smsCodeKey = smsKey;
           saveConfig(appConfig);
@@ -5482,7 +5483,8 @@ function rewardNeedsDesktop(prodId, prodType) {
         body: form.toString()
       });
       const bindData = await bindRes.json();
-      if (bindData.code === 0 || bindData.code === 200) {
+      const bindCode = normalizeBusinessCode(bindData.code);
+      if (bindCode === 0 || bindCode === 200) {
         acc.bound = true;
         delete acc._smsCodeKey;
         // 同步会话态：官方已信任本设备，免密凭据 (genLoginToken/tokenLogin) 与静默续期自此恢复可用
