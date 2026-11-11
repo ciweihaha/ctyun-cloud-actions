@@ -1391,7 +1391,7 @@ class YdpcClient {
    * @param {number} intervalSec  快照间隔（秒）
    * @returns {Promise<object>} 验证报告
    */
-  async verifyKeepAliveEffect(durationSec = 60, intervalSec = 15) {
+  async verifyKeepAliveEffect(durationSec = 60, intervalSec = 15, opts = {}) {
     const accName = this.account.name || this.account.user;
     const started = Date.now();
     const report = {
@@ -1473,6 +1473,10 @@ class YdpcClient {
     );
     report.ok = report.poweredThroughout && report.errors.length === 0;
 
+    // 深查第 21 轮：originCn 此前全仓只出现一次且从未定义（函数签名无第三参数），
+    // 每次核验在采样结束后都在此处抛 ReferenceError，报告永远返回不了——手动接口
+    // 每次 400，看门狗的核验也被静默吞掉。看门狗传 { origin: 'auto' }，据此区分称谓。
+    const originCn = opts && opts.origin === 'auto' ? '自动核验' : '手动核验';
     this.appendLog(
       'CAG',
       `[${accName}] ${originCn}结束：${report.ok ? '✅ 通过' : '❌ 未通过'}（持续 ${report.durationSeconds}s，采样 ${report.snapshots.length} 次，错误 ${report.errors.length} 次${report.firstOffSeconds !== null ? `，首次离线于 ${report.firstOffSeconds}s` : ''}）`,
