@@ -35,6 +35,7 @@ const requestContext = new AsyncLocalStorage();
 const CORS_ALLOWED_ORIGINS = parseAllowedOrigins(process.env.CTYUN_CORS_ORIGINS);
 const { TaskScheduler } = require('./app/tasks/scheduler');
 const { validateSettingsUpdate, sanitizeSettingsForRestore } = require('./app/settings_validation');
+const { isTaskCenterExpired, isTaskListOk, isPointsOk } = require('./app/task_center');
 const { SohoClient } = require('./app/ydpc/soho_client');
 const { performCagAuthHold } = require('./app/ydpc/cag_client');
 const { YdpcClient } = require('./app/ydpc/ydpc_client');
@@ -2243,12 +2244,12 @@ class CtYunClient {
         headers: this.getSignedHeaders()
       })).json();
 
-      if (taskRes.code === 40010 || String(taskRes.msg || '').includes('登录信息已过期') || String(taskRes.msg || '').includes('会话已过期')) {
+      if (isTaskCenterExpired(taskRes)) {
         await this.renewToken().catch(() => {});
         reason = `凭据过期 (code=${taskRes.code || taskRes.msg})`;
       }
 
-      if (taskRes.code === 0 && taskRes.data) {
+      if (isTaskListOk(taskRes)) {
         this.metrics.officialTasks = taskRes.data.map(t => ({
           name: t.taskDefName,
           current: t.currentProgress || 0,
@@ -2295,7 +2296,7 @@ class CtYunClient {
         headers: this.getSignedHeaders()
       })).json();
 
-      if (pointRes.code === 0 && Array.isArray(pointRes.data) && pointRes.data.length > 0) {
+      if (isPointsOk(pointRes)) {
         // pointRes.data 数组可能包含两项，一项为 willOutDate: true 即将过期的子积分（如100分），一项为真实总积分（如900分）
         // 优先精准提取非即将过期（willOutDate != true）的主账户可用总积分项；若都无标识则取数值最大项
         const validItem = pointRes.data.find(p => !p.willOutDate && p.pointType === 1) ||
