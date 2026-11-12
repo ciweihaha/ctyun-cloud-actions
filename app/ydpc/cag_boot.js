@@ -82,10 +82,16 @@ const CSAP_TOKEN_RETRY_CODES = new Set(['1000100']);
  *   csap_key → "3fec8a54-7e49-48"
  *   uas_key  → "56Acf4c3498fD4c5a0B1fb26947e2daB"
  *   uas_iv   → "3498fD4c5a0B1fbA"
+ *
+ * 【审查修复 M11】公开仓库硬编码该密钥的风险口径见 README「中兴 CAG 对称密钥声明」：
+ * 它不是用户凭据，但可被任意人用于构造仿冒客户端，且厂商轮换密钥时所有部署
+ * 同时失效。现支持环境变量注入覆盖（厂商轮换时无需改代码即可更新）；默认值
+ * 保留以保证现有部署开箱即用，删除默认值会导致所有现有部署立即失效。
+ *   CTYUN_ZTE_UAS_KEY / CTYUN_ZTE_UAS_IV / CTYUN_ZTE_CSAP_ID
  */
-const ZTE_UAS_KEY = '56Acf4c3498fD4c5a0B1fb26947e2daB'; // 32B → AES-256-CBC
-const ZTE_UAS_IV = '3498fD4c5a0B1fbA';                  // 16B → AES-CBC IV
-const ZTE_CSAP_ID = '3fec8a54-7e49-48';                 // 16B → AES-128-ECB
+const ZTE_UAS_KEY = process.env.CTYUN_ZTE_UAS_KEY || '56Acf4c3498fD4c5a0B1fb26947e2daB'; // 32B → AES-256-CBC
+const ZTE_UAS_IV = process.env.CTYUN_ZTE_UAS_IV || '3498fD4c5a0B1fbA';                  // 16B → AES-CBC IV
+const ZTE_CSAP_ID = process.env.CTYUN_ZTE_CSAP_ID || '3fec8a54-7e49-48';                 // 16B → AES-128-ECB
 
 /**
  * 【2026-09-23 实测结论】CAG 服务端证书链不完整。

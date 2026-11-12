@@ -324,9 +324,16 @@ async function executeNativeAiChat(client, acc, onLog = console.log) {
 
   // 3. 生成 16 字节随机密钥并使用 RSA-PKCS1 加密
   onLog('AIChat', `RSA-PKCS1 加密生成客户端鉴权凭据，换取对话会话密钥 (SessionKey)...`, 'info');
+  // 【审查修复 L5】clientKey 是解密 sessionKey 的密钥材料：旧实现用 Math.random
+  // 生成（可预测），现改用 crypto.randomBytes（拒绝采样避免取模偏差）。
   const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
   let clientKey = '';
-  for (let i = 0; i < 16; i++) clientKey += chars[Math.floor(Math.random() * chars.length)];
+  while (clientKey.length < 16) {
+    const b = crypto.randomBytes(16);
+    for (let i = 0; i < b.length && clientKey.length < 16; i++) {
+      if (b[i] < 248) clientKey += chars[b[i] % chars.length]; // 248 = 62*4，拒绝 ≥248 的字节
+    }
+  }
   const pem = `-----BEGIN PUBLIC KEY-----\n${ssopk}\n-----END PUBLIC KEY-----`;
   const encClientKey = crypto.publicEncrypt({ key: pem, padding: crypto.constants.RSA_PKCS1_PADDING }, Buffer.from(clientKey, 'utf8')).toString('hex');
 

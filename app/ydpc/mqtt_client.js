@@ -5,6 +5,8 @@
 
 const tls = require('tls');
 const crypto = require('crypto');
+// 【审查修复 M2】复用 cag_boot 的证书链缺陷判定做受控降级（cag_boot 只依赖内置模块，无循环引用）。
+const { isCertChainError } = require('./cag_boot');
 
 function encodeRemainingLength(length) {
   const buffer = [];
@@ -111,12 +113,18 @@ class MqttKeepAliveClient {
         }
       }, timeoutMs);
 
+      // 【审查修复 M2】受控降级（复用 cag_boot 模式）：默认严格校验 TLS；
+      // 旧实现无条件 rejectUnauthorized:false，CONNECT 报文携带账号用户名/密码，
+      // 中间人可窃取凭据；且注释称 SNI 用于"证书合法性校验"——不校验时 SNI
+      // 不产生任何校验效果，注释与行为矛盾。现仅证书链缺陷类错误才降级重试一次。
+      const attemptTls = (allowInsecure) => {
       try {
         const tlsOptions = {
           host: targetIp,
           port: this.port,
-          servername: this.host, // 保持原始 host 用于 TLS SNI 证书合法性校验
-          rejectUnauthorized: false
+          // SNI：严格校验时同时用于主机名校验；降级重试时仅作路由提示。
+          servername: this.host,
+          ...(allowInsecure ? { rejectUnauthorized: false } : {})
         };
 
         this.socket = tls.connect(tlsOptions, () => {
@@ -179,6 +187,19 @@ class MqttKeepAliveClient {
         });
 
         this.socket.on('error', (err) => {
+          // 【审查修复 M2】受控降级：严格校验下、尚未连通且错误属于证书链缺陷类时，
+          // 留证后降级重试一次；其余错误按原口径拒绝。
+          if (!allowInsecure && !this.isConnected && !isResolved) {
+            const certCode = isCertChainError(err);
+            if (certCode) {
+              this.onLog('MQTT', `⚠️ MQTT TLS 证书链校验失败 (${certCode})，已留证并降级重试一次（见 cag_boot 受控降级策略）`, 'warning');
+              try { this.socket.removeAllListeners(); } catch (e) {}
+              try { this.socket.destroy(); } catch (e) {}
+              this.socket = null;
+              attemptTls(true);
+              return;
+            }
+          }
           clearTimeout(timeout);
           if (!isResolved) {
             isResolved = true;
@@ -205,6 +226,9 @@ class MqttKeepAliveClient {
           reject(err);
         }
       }
+      };
+
+      attemptTls(false);
     });
   }
 

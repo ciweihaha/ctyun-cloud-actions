@@ -112,3 +112,32 @@ test('今日已完成 → already_completed，不启动浏览器', async () => {
   assert.equal(r.reason, 'already_completed');
   assert.equal(spawned, false);
 });
+
+// 【审查修复 L16】旧 profile 清理：只删超期旧目录，新目录与排除目录保留；
+// 非本模块前缀的目录绝不触碰。
+test('cleanupStaleProfiles: 只清理超期旧 profile，保留新的与排除的', () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const tmp = os.tmpdir();
+  const tag = `test-${process.pid}-${Date.now()}`;
+  const stale = path.join(tmp, `ctyun-browser-hang-stale-${tag}`);
+  const fresh = path.join(tmp, `ctyun-browser-hang-fresh-${tag}`);
+  const excluded = path.join(tmp, `ctyun-browser-hang-excluded-${tag}`);
+  const other = path.join(tmp, `other-prefix-${tag}`);
+  for (const d of [stale, fresh, excluded, other]) fs.mkdirSync(d, { recursive: true });
+  try {
+    const old = new Date(Date.now() - 31 * 24 * 3600 * 1000);
+    fs.utimesSync(stale, old, old);
+    fs.utimesSync(excluded, old, old);
+    fs.utimesSync(other, old, old);
+    const removed = bh.cleanupStaleProfiles({ exceptDirs: new Set([excluded]) });
+    assert.equal(removed, 1, '只应删掉超期且未排除的 stale 目录');
+    assert.equal(fs.existsSync(stale), false);
+    assert.equal(fs.existsSync(fresh), true, '新目录必须保留');
+    assert.equal(fs.existsSync(excluded), true, '排除目录必须保留');
+    assert.equal(fs.existsSync(other), true, '非本模块前缀绝不触碰');
+  } finally {
+    for (const d of [stale, fresh, excluded, other]) fs.rmSync(d, { recursive: true, force: true });
+  }
+});

@@ -39,4 +39,6 @@ jobs:
       - env:
           CTYUN_USER: ${{ secrets.CTYUN_USER }}
           CTYUN_PASS: ${{ secrets.CTYUN_PASS }}
+          CTYUN_SESSION: ${{ secrets.CTYUN_SESSION }}
+          CTYUN_DEVICE_CODE: ${{ secrets.CTYUN_DEVICE_CODE }}
         run: node cli.js

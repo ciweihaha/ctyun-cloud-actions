@@ -7,6 +7,9 @@ const path = require('path');
 // verifyPassword 同时兼容旧格式（64 位 hex 的 SHA256+固定 salt），仅用于验证、不再产生。
 const SCRYPT_OPTS = { N: 16384, r: 8, p: 1, maxmem: 32 * 1024 * 1024 };
 const LEGACY_SALT = 'ctyun_salt_2026';
+// 【审查修复 L7】用户不存在时仍跑一次等价耗时的 verifyPassword，避免时序差异
+// 泄露用户名存在性。这只是一个格式合法的假 hash，不对应任何真实密码。
+const FAKE_PASSWORD_HASH = 'scrypt$00000000000000000000000000000000$' + '00'.repeat(32);
 
 function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString('hex');
@@ -156,11 +159,16 @@ class AuthManager {
   login(username, password, remember = false) {
     const cfg = this.configManager.config;
     const user = (cfg.users || []).find(u => u.username === username);
-    if (!user) return { success: false, error: '用户不存在' };
+    // 【审查修复 L7】"用户不存在"与"密码错误"区分返回可枚举用户名，统一文案。
+    // 用户不存在时仍跑一次 verifyPassword（对固定假 hash），避免时序差异泄露存在性。
+    if (!user) {
+      verifyPassword(password, FAKE_PASSWORD_HASH);
+      return { success: false, error: '用户名或密码错误' };
+    }
 
     // 【安全整改 2026-10-15】改走 verifyPassword（scrypt+随机 salt；兼容旧 SHA256 格式仅用于验证）
     if (!verifyPassword(password, user.passwordHash)) {
-      return { success: false, error: '密码错误' };
+      return { success: false, error: '用户名或密码错误' };
     }
 
     const token = this.createSession(user, remember);
@@ -228,6 +236,11 @@ class AuthManager {
 
     if (!cfg.users) cfg.users = [];
 
+    // 【审查修复 L8】旧实现 body.username 缺失时 username.trim() 抛 TypeError → 500。
+    // 先校验类型，缺失/非字符串按空用户名处理。
+    if (typeof username !== 'string' || typeof password !== 'string') {
+      return { success: false, error: '用户名和密码不能为空' };
+    }
     const cleanUser = username.trim();
     if (!cleanUser || !password) {
       return { success: false, error: '用户名和密码不能为空' };

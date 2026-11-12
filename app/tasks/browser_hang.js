@@ -54,6 +54,33 @@ function profileDirFor(key) {
   return path.join(os.tmpdir(), `ctyun-browser-hang-${sanitizeKey(key)}`);
 }
 
+// 【审查修复 L16】旧 profile 清理：每个账号的 Chrome profile（含会话数据）留在
+// 系统临时目录长期累积。不能在挂机结束时删除当前 profile——门户登录态靠
+// profile 里的 Cookie 维持，删了下次挂机需重新手动登录。故改为启动时清理
+// "超过 30 天未使用且不属于在跑挂机"的旧 profile 目录；30 天未用的会话
+// 正常情况下早已过期，删除不影响可用性。
+const STALE_PROFILE_MAX_AGE_MS = 30 * 24 * 3600 * 1000;
+
+function cleanupStaleProfiles({ exceptDirs = new Set(), maxAgeMs = STALE_PROFILE_MAX_AGE_MS } = {}) {
+  let removed = 0;
+  try {
+    const tmp = os.tmpdir();
+    for (const name of fs.readdirSync(tmp)) {
+      if (!name.startsWith('ctyun-browser-hang-')) continue;
+      const dir = path.join(tmp, name);
+      if (exceptDirs.has(dir)) continue;
+      try {
+        const st = fs.statSync(dir);
+        if (!st.isDirectory()) continue;
+        if (Date.now() - st.mtimeMs < maxAgeMs) continue;
+        fs.rmSync(dir, { recursive: true, force: true });
+        removed++;
+      } catch (e) { /* 单个目录清理失败不影响其他 */ }
+    }
+  } catch (e) { /* 临时目录不可读时静默跳过 */ }
+  return removed;
+}
+
 /**
  * 查找可用的浏览器可执行文件路径（Windows 固定路径 + PATH；补充 Linux 候选，
  * 旧实现只有 Windows 路径与 where 命令，在非 Windows 部署必然 no_browser）
@@ -235,6 +262,12 @@ async function executeBrowserHang(client, acc, onLog, opts = {}) {
     fs.mkdirSync(userDataDir, { recursive: true });
   } catch (e) {}
 
+  // 【审查修复 L16】启动时清理 30 天未用的旧 profile（排除本次目录与在跑挂机的目录）
+  const activeProfileDirs = new Set([...activeHangs.keys()].map(k => profileDirFor(k)));
+  activeProfileDirs.add(userDataDir);
+  const cleanedProfiles = cleanupStaleProfiles({ exceptDirs: activeProfileDirs });
+  if (cleanedProfiles > 0) log('BrowserHang', `[${accName}] 已清理 ${cleanedProfiles} 个超过 30 天未使用的旧浏览器 profile`, 'info');
+
   const portalUrl = getWebPortalUrl(client, desktop);
   log('BrowserHang', `[${accName}][${desktopName}] 正在启动浏览器打开云电脑门户...`, 'info');
 
@@ -344,4 +377,6 @@ module.exports = {
   getActiveBrowserHangs,
   HANG_DURATION_MS,
   findBrowserPath,
+  cleanupStaleProfiles,
+  STALE_PROFILE_MAX_AGE_MS,
 };
