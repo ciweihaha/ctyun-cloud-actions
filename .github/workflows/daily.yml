@@ -11,6 +11,9 @@ permissions:
   contents: read
 
 # G10: prevent overlapping runs against the same account
+# 2026-11-12 审计：cancel-in-progress 保持 false —— 定时任务绝不能中途取消。
+# 注意：cancel=false 时，若已有排队中的旧跑，会被更新的排队跑取代；本仓每天两班、
+# 单次远小于 12 小时间隔，正常情况下不会出现排队，无需改动。
 concurrency:
   group: ctyun-daily-tasks
   cancel-in-progress: false
@@ -18,7 +21,10 @@ concurrency:
 jobs:
   ctyun-tasks:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # 2026-11-12 审计：任务实测 60–75 分钟；90 分钟上限在 10-18 至 10-25 期间
+    # 导致 12 次定时跑被超时取消（node cli.js 步骤被 kill）。放宽到 180 分钟
+    # 留足余量；GitHub 单 job 上限 360 分钟。
+    timeout-minutes: 180
     steps:
       # G10: actions pinned to full commit SHA of the v7 tags
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
