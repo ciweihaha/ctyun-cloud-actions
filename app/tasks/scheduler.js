@@ -950,7 +950,11 @@ class TaskScheduler {
                   // 明确业务错误才有限重试；网络异常等结果不明确的情况绝不盲目重试，
                   // 防止「服务端已受理但响应丢失」被重试成重复扣积分。
                   const orderResult = await attemptRedeemOrder({
-                    fetchFn: (u, init) => fetch(u, init),
+                    // 【审查修复 M4】旧实现裸 fetch 无超时：placeOrder 一旦挂起，
+                    // runAllAccounts 的串行循环永久阻塞，isRunning 恒为 true，
+                    // 此后所有调度触发都被静默跳过，只能重启恢复。现加 30 秒超时；
+                    // 超时抛错按 S11 的 unknown 口径处理（不重试、人工核对）。
+                    fetchFn: (u, init) => fetch(u, { ...init, signal: AbortSignal.timeout(30000) }),
                     url: 'https://desk.ctyun.cn/selforder/api/selforder/paas/placeOrder',
                     headers: client.getSignedHeaders({ 'Content-Type': 'application/json;charset=UTF-8' }),
                     payload,
