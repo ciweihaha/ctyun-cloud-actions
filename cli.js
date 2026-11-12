@@ -1,5 +1,7 @@
 // 天翼云电脑 GitHub Actions 版 — cli.js v2（登录修复版）
 // 环境变量: CTYUN_USER, CTYUN_PASS, 可选 CTYUN_SESSION（导出的 savedLoginInfo JSON）
+// 可选 CTYUN_DEVICE_CODE：固定设备码 Secret；未设时每次运行生成临时设备码
+// （见 L12：全新设备码登录可能触发设备绑定/短信验证）。
 //
 // v2 修复了什么（2026-10-17 代码审查发现）：
 // 旧 cli.js 直接调 client.login()，但 CtYunClient.login() 只有两条路——
@@ -59,6 +61,11 @@ async function loginWithSession(client) {
   try { sess = JSON.parse(raw); } catch (e) {
     return { tried: true, success: false, error: 'CTYUN_SESSION 不是合法 JSON' };
   }
+  // 【审查修复 L13】旧实现只校验 JSON 合法性：合法 JSON 但非对象（如字符串）
+  // 会被当作 loginInfo，后续以晦涩方式失败。现要求为含 userId/token 的对象。
+  if (!sess || typeof sess !== 'object' || Array.isArray(sess) || (sess.userId === undefined && sess.token === undefined)) {
+    return { tried: true, success: false, error: 'CTYUN_SESSION 结构非法：应为含 userId/token 的会话对象 JSON' };
+  }
   client.loginInfo = sess;
   const r = await client.login();
   return { tried: true, success: !!r.success, error: r.error };
@@ -108,12 +115,20 @@ async function main() {
   const acc = {
     id: 'gh-action', name: 'GitHub Actions', user, password: pass,
     platform: 'ctyun', enabled: true,
-    deviceCode: genDeviceCode(),
+    // 【审查修复 L12】设备码优先复用 CTYUN_DEVICE_CODE Secret：旧实现每次运行都
+    // 生成全新 deviceCode，以"新设备"登录，可能触发设备绑定/短信验证。
+    // 未设 Secret 时保持旧行为（现生成），并在下方提示用户固定设备码。
+    deviceCode: (process.env.CTYUN_DEVICE_CODE || '').trim() || genDeviceCode(),
     features: { keepAlive: true, autoSign: true, aiChat: true, cloudHang: true, autoRedeem: true },
     stats: {},
   };
 
   const client = new CtYunClient(acc);
+  if (process.env.CTYUN_DEVICE_CODE) {
+    onLog('Login', `使用 CTYUN_DEVICE_CODE 固定设备码 (${mask(acc.deviceCode, 8)})`, 'info');
+  } else {
+    onLog('Login', '未设置 CTYUN_DEVICE_CODE，本次使用临时设备码；建议在 Secrets 中固定一个设备码，避免每次以新设备登录触发验证', 'warning');
+  }
   const results = {};
 
   // —— 登录：会话优先，密码兜底 ——
@@ -161,6 +176,16 @@ async function main() {
   onLog('Main', '自动兑换：本次跳过（需要 dashboard 的 redeemConfig，硬编码下单有误兑风险）', 'warning');
 
   onLog('Main', `汇总: ${JSON.stringify(results)}`, 'success');
+  // 【审查修复 M3】旧实现无论成败都 exit 0，Actions 失败不可见、无告警、无重试。
+  // 现签到/AI 任一异常即 exit 1；挂机异常降级为警告（服务端计时不丢，下次调度可续跑）。
+  const criticalFailed = [results.sign, results.aiChat].some(v => typeof v === 'string' && v.startsWith('异常'));
+  if (criticalFailed) {
+    onLog('Main', '关键任务（签到/AI）出现异常，以非零退出码标记本次运行失败', 'error');
+    process.exit(1);
+  }
+  if (typeof results.hang === 'string' && results.hang.startsWith('异常')) {
+    onLog('Main', '挂机异常已记录为警告（服务端计时不丢，下次调度继续），本次运行仍视为成功', 'warning');
+  }
   process.exit(0);
 }
 
