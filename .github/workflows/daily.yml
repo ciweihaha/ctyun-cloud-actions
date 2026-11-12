@@ -18,7 +18,7 @@ concurrency:
 jobs:
   ctyun-tasks:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 150
     steps:
       # G10: actions pinned to full commit SHA of the v7 tags
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -33,4 +33,6 @@ jobs:
       - env:
           CTYUN_USER: ${{ secrets.CTYUN_USER }}
           CTYUN_PASS: ${{ secrets.CTYUN_PASS }}
+          CTYUN_SESSION: ${{ secrets.CTYUN_SESSION }}
+          CTYUN_DEVICE_CODE: ${{ secrets.CTYUN_DEVICE_CODE }}
         run: node cli.js
