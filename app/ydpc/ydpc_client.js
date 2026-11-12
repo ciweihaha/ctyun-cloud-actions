@@ -1906,11 +1906,16 @@ class YdpcClient {
       // 也无法自愈，因为守卫直接 return）。复位后下一轮轮询即可自动重试。
       this.workerRunning = false;
       if (this.loopTimer) { clearTimeout(this.loopTimer); this.loopTimer = null; }
-      this.appendLog(
-        'CAG',
-        `[${accName}] ❌ 移动爱家保活看门狗启动失败，已复位为"未启动"以便下轮自动重试: ${err.message}`,
-        'error', accName, 'ydpc'
-      );
+      // 【第 27 轮】回滚里的日志本身也可能写失败（生产 appendLog 走磁盘落盘）——
+      // 回滚已完成，日志写失败不得把异常再抛回调用方：finalizeEcloudAccount /
+      // initAllKeepAlive 等调用点无守卫，一抛就会连带打断账号创建或其余账号启动。
+      try {
+        this.appendLog(
+          'CAG',
+          `[${accName}] ❌ 移动爱家保活看门狗启动失败，已复位为"未启动"以便下轮自动重试: ${err.message}`,
+          'error', accName, 'ydpc'
+        );
+      } catch (_) { /* 回滚已完成，日志不可用时静默丢弃 */ }
     }
   }
 

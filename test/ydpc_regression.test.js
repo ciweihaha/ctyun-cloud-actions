@@ -270,3 +270,29 @@ test('组 23：ydpc_client.js 的 keepaliveProven 恒为 false 字面量（变�
     assert.equal(m[1], 'false', 'keepaliveProven 只能是 false 字面量，严禁改成运行时推导');
   }
 });
+
+// --- 第 27 轮：组 13（续）—— 启动失败且日志也写失败时仍完成回滚 ----------------
+// A/B 对照的 A：本测试先于修复落盘，在未修复代码上应失败——
+// appendLog 首调即抛（模拟磁盘落盘失败）时，startKeepAliveWorker 内层
+// appendLog 在 workerRunning=true 之后抛错，走外层 catch 回滚；回滚里的
+// appendLog 同样抛错，未修复时该异常会原样抛回调用方。
+
+test('组 13：startKeepAliveWorker 启动失败且日志也写失败时仍完成回滚、不抛回调用方', () => {
+  const acc = {
+    id: 'probe13b', name: 'probe13b', user: '13800000000', password: 'x',
+    deviceCode: 'web_probe', platform: 'ydpc', features: { keepAlive: true }, stats: {},
+    vms: [runningVm()],
+  };
+  const client = new YdpcClient(acc, {
+    appendLog: () => { throw new Error('disk full'); },
+    sendNotification: () => {},
+    saveConfig: () => {},
+  });
+  assert.doesNotThrow(() => client.startKeepAliveWorker());
+  assert.equal(client.workerRunning, false, '回滚后 workerRunning 必须复位为 false');
+  assert.equal(client.loopTimer, null, '回滚后不得残留已排程的循环定时器');
+  // 回滚后守卫不再锁死，下轮可再次尝试启动（而不是永久静默停摆）
+  assert.doesNotThrow(() => client.startKeepAliveWorker());
+  assert.equal(client.workerRunning, false);
+  assert.equal(client.loopTimer, null);
+});
