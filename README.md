@@ -23,6 +23,8 @@ GitHub Actions（daily.yml）所需 Secrets：
 | --- | --- |
 | `CTYUN_USER` | 天翼云账号（手机号），仅注入 `node cli.js` 步骤 |
 | `CTYUN_PASS` | 天翼云账号密码，同上 |
+| `CTYUN_SESSION` | 可选：导出的 savedLoginInfo JSON，会话优先登录（无头免验证码）；结构非法时自动回落账号密码直登 |
+| `CTYUN_DEVICE_CODE` | 可选：固定设备码；未设时每次运行生成临时设备码，以"新设备"登录可能触发设备绑定/短信验证 |
 
 仪表盘服务（server.js）关键环境变量：
 
@@ -33,6 +35,26 @@ GitHub Actions（daily.yml）所需 Secrets：
 | `CTYUN_DASHBOARD_ADMIN_PASSWORD` | （随机生成） | 初始管理员口令；未设时随机生成并写入 `data/.admin-init-password.log`（0600） |
 | `CTYUN_CORS_ORIGINS` | （空） | 额外允许的跨域来源，逗号分隔；同源请求恒放行 |
 | `CTYUN_FATAL_EXCEPTION_THRESHOLD` | `5` | 10 分钟窗口内未捕获异常达到该次数后进程主动退出，交守护重启 |
+| `CTYUN_ZTE_UAS_KEY` / `CTYUN_ZTE_UAS_IV` / `CTYUN_ZTE_CSAP_ID` | （内置默认值） | 中兴 CAG 对称密钥覆盖；厂商轮换密钥时用此更新，无需改代码（见下「中兴 CAG 对称密钥声明」） |
+
+## 仪表盘前端说明
+
+仪表盘前端文件（`app/static/`，即 `GET /` 返回的控制台页面）**不在本仓库中**：按当前仓库检出部署，`GET /` 会返回 404，只有 API 与 `/desktop-view`（桌面视图）可用。如你持有前端文件，将其放入 `app/static/`（`index.html` 为入口）后重启服务即可恢复控制台 UI；本仓库不虚构前端来源，如需确认前端仓库请联系仓库维护者。
+
+## 中兴 CAG 对称密钥声明
+
+`app/ydpc/cag_boot.js` 中的 `ZTE_UAS_KEY` / `ZTE_UAS_IV` / `ZTE_CSAP_ID` 是中兴 CAG 网关与官方客户端之间的**固定对称密钥**，来自官方客户端安装包自带的 `installinfo.ini`（公开分发材料），**不是按用户签发的凭据**，也不含任何账号信息。风险口径：
+
+- 该密钥可被任意人用于构造仿冒客户端或解密网关流量；不要把它当作"秘密"依赖。
+- 厂商轮换该密钥时，所有未更新的部署会同时失效；届时用上表环境变量注入新值即可恢复，无需改代码。
+- 默认值保留在代码中是为了保证现有部署开箱即用；删除默认值会导致所有现有部署立即失效。
+
+## TLS 与部署安全
+
+仪表盘服务本身仅提供 HTTP（无内置 HTTPS 监听）：
+
+- 默认监听 `127.0.0.1`，仅本机可访问，风险有限。
+- Docker 或局域网部署（`HOST=0.0.0.0`）时，**必须**在前面加反向代理（Nginx/Caddy 等）提供 TLS：会话 token 与配置导出中的明文密码会在局域网明文传输，不要把 HTTP 端口直接暴露到不可信网络。
 
 ## 测试
 
