@@ -642,7 +642,10 @@ class YdpcClient {
 
     const { cagBootVm } = require('./cag_boot');
     const result = await cagBootVm(firmAuth, {
-      onLog: (label, message, level) => this.appendLog(label, `[${name}] ${message}`, level, name, 'ydpc')
+      onLog: (label, message, level) => this.appendLog(label, `[${name}] ${message}`, level, name, 'ydpc'),
+      // 2026-11-12 审计修复：显式关闭报文级日志（默认已是 false，此处再焊死一次，
+      // 防默认被改回 true 后开机路径的令牌/连接串进 Actions 日志）
+      wireLog: false,
     });
 
     if (result.success) {
