@@ -30,6 +30,19 @@ test('解密失败返回空并触发 onError，绝不返回密文本身（核心
   assert.equal(b.decryptPassword('ENC:bad:format:xx:yy'), '');
 });
 
+// 【审查修复 L14】真实密码以 ENC: 开头时：旧实现 encrypt 时遇前缀直接返回原文，
+// 落盘后再 decrypt 按密文解析失败返回 ''，账号即无法登录。现只有符合真实密文
+// 格式的值才跳过重复加密，ENC: 开头的明文正常加密往返。
+test('以 ENC: 开头的真实密码可正常加密往返', () => {
+  const { encryptPassword, decryptPassword } = createPasswordCrypto(key);
+  const enc = encryptPassword('ENC:my-real-password');
+  assert.notEqual(enc, 'ENC:my-real-password', 'ENC: 开头明文必须真正加密，不得原样返回');
+  assert.ok(enc.startsWith('ENC:'));
+  assert.equal(decryptPassword(enc), 'ENC:my-real-password');
+  // 真实密文仍不得重复加密（原有回归口径不变）
+  assert.equal(encryptPassword(enc), enc);
+});
+
 test('密钥丢失场景：saveConfig 式断言可拦截明文落盘', () => {
   // 模拟 saveConfig：加密产物必须全部以 ENC: 开头，否则中止写入
   const bad = createPasswordCrypto(Buffer.alloc(10));
