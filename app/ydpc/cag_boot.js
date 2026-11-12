@@ -160,8 +160,9 @@ const _certChainWarned = new Set();
  * 无法定位是接口路径、参数名、还是请求体格式的问题。
  * 因此提供可选的 wire 日志：把 URL、请求体、响应状态、响应体原文完整打出。
  *
- * ⚠️ 安全：日志会对 password / accessToken 等字段做脱敏，避免明文泄露到日志；
+ * ⚠️ 安全：日志会对敏感字段做脱敏（见 redactForLog），避免明文泄露到日志；
  * 但**请求体与响应体结构本身会原样打印** —— 仅用于本地调试，勿长期开启。
+ * 2026-11-12 起默认关闭（cagBootVm 的 opts.wireLog 默认 false），本地排障才显式开。
  */
 function makeWireLogger(onLog) {
   if (typeof onLog !== 'function') return null;
@@ -174,8 +175,38 @@ function makeWireLogger(onLog) {
   };
 }
 
-// 需要在日志中脱敏的字段名
-const SENSITIVE_KEYS = ['password', 'accessToken', 'token', 'vmPassword', 'secret'];
+// 需要在日志中脱敏的字段名（子串匹配，不区分大小写）。
+// 2026-11-12 审计修复：旧版只做精确匹配（如 'accessToken'），漏掉 refreshToken /
+// access_token / sessionId / connectStr / Cookie 等；且 redactForLog 对字符串输入
+// 原样返回，而两处调用点传的都是字符串（请求体/响应体原文），等于完全不脱敏。
+// 新版：字符串先尝试按 JSON 解析再递归脱敏；解析失败时用正则 scrub 掉
+// "key":"value" 与 key=value 形态的敏感字段。
+const SENSITIVE_KEY_PARTS = [
+  'password', 'passwd', 'pwd', 'token', 'secret', 'cookie',
+  'auth', 'credential', 'session', 'connectstr', 'private',
+];
+
+function isSensitiveKey(k) {
+  const lk = String(k).toLowerCase();
+  return SENSITIVE_KEY_PARTS.some((part) => lk.includes(part));
+}
+
+// 非 JSON 字符串里的敏感键值形态： "key" : "value" / 'key'='value' / key=value
+function scrubSensitivePairs(text) {
+  const parts = SENSITIVE_KEY_PARTS.join('|');
+  let out = String(text);
+  // JSON 形态："accessToken":"xxx"（值内含引号时只处理到第一个闭合引号，宁可多遮）
+  out = out.replace(
+    new RegExp(`"([^"]*(?:${parts})[^"]*)"\s*:\s*"[^"]*"`, 'gi'),
+    '"$1":"<redacted>"'
+  );
+  // 查询串 / 表单形态：token=xxx& / password=xxx;
+  out = out.replace(
+    new RegExp(`((?:${parts})[^=&;\s]*)\s*=\s*[^&;\s]+`, 'gi'),
+    '$1=<redacted>'
+  );
+  return out;
+}
 
 /**
  * 对请求/响应体做脱敏，保留结构。过长时截断。
@@ -187,7 +218,7 @@ function redactForLog(value, maxLen = 1200) {
     if (typeof v === 'object') {
       const out = {};
       for (const [k, val] of Object.entries(v)) {
-        if (SENSITIVE_KEYS.some((s) => k.toLowerCase() === s.toLowerCase())) {
+        if (isSensitiveKey(k)) {
           const sv = val === null || val === undefined ? '' : String(val);
           out[k] = sv ? `<redacted len=${sv.length}>` : sv;
         } else {
@@ -200,9 +231,22 @@ function redactForLog(value, maxLen = 1200) {
   };
   let text;
   try {
-    text = typeof value === 'string' ? value : JSON.stringify(walk(value));
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (
+        (trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+        (trimmed.startsWith('[') && trimmed.endsWith(']'))
+      ) {
+        // 响应体多为 JSON 文本：解析后递归脱敏再序列化，令牌不再原文落日志
+        text = JSON.stringify(walk(JSON.parse(trimmed)));
+      } else {
+        text = scrubSensitivePairs(value);
+      }
+    } else {
+      text = JSON.stringify(walk(value));
+    }
   } catch (e) {
-    text = String(value);
+    text = typeof value === 'string' ? scrubSensitivePairs(value) : String(value);
   }
   if (text === undefined || text === null) text = '';
   if (text.length > maxLen) text = text.slice(0, maxLen) + `...<truncated total=${text.length}>`;
@@ -843,7 +887,9 @@ function cagHttpsRequest(host, port, pathWithQuery, body, timeoutMs = DEFAULT_RE
  * @param {function} opts.onLog  日志回调 (label, message, level)
  * @param {number} opts.bootWait 等待桌面就绪上限（秒），默认 180
  * @param {number} opts.timeout  单次请求超时（毫秒），默认 15000
- * @param {boolean} opts.wireLog 是否打印报文级日志，默认 true
+ * @param {boolean} opts.wireLog 是否打印报文级日志，默认 false（2026-11-12 审计修复：
+ *   首跑排障期已过；默认开启会把请求/响应体打进 Actions 日志。本地排障时显式传
+ *   true，或设环境变量 CTYUN_WIRE_LOG=1）
  * @param {number} opts.connectRetries CAG2.0 下 async_query 404 时重试 connectDesktop 次数
  * @returns {Promise<{success: boolean, message: string, connectStr?: string, accessToken?: string, waitedSeconds?: number}>}
  */
@@ -851,8 +897,12 @@ async function cagBootVm(firmAuth, opts = {}) {
   const onLog = typeof opts.onLog === 'function' ? opts.onLog : () => {};
   const bootWait = Number.isFinite(opts.bootWait) ? opts.bootWait : DEFAULT_BOOT_WAIT;
   const reqTimeout = Number.isFinite(opts.timeout) ? opts.timeout : DEFAULT_REQ_TIMEOUT;
-  // 报文级日志默认开启（首跑排障期），可通过 opts.wireLog = false 关闭
-  const wire = opts.wireLog === false ? null : makeWireLogger(onLog);
+  // 报文级日志默认关闭（2026-11-12 审计修复：默认开启时请求/响应体进日志，
+  // 且旧 redactForLog 对字符串不脱敏）。本地排障显式 opts.wireLog = true，
+  // 或环境变量 CTYUN_WIRE_LOG=1。
+  const wire = opts.wireLog === true || process.env.CTYUN_WIRE_LOG === '1'
+    ? makeWireLogger(onLog)
+    : null;
 
   // 【2026-09-23】整个开机流程共享一个会话容器。
   // CAG 服务端用会话状态串联"查配置 → 取 token → 提交连接 → 轮询"几步；

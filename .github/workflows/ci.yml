@@ -8,6 +8,10 @@ permissions:
   contents: read
 
 concurrency:
+  # 2026-11-12 审计：cancel-in-progress: true 是预期行为，不要改成 false。
+  # CI 单次约 1 分钟；同一分支数秒内连续推送时，旧跑被取消、只跑最新一次。
+  # 2026-11-12 mica/review-fixes 分支 4 分钟内 10 次推送 → 9 次取消、最新 2 次成功，
+  # 均属该机制正常工作。理顺靠推送节奏（本地先测、攒批一次推），不是关取消。
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
