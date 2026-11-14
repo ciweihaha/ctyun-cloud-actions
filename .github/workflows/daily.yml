@@ -39,4 +39,7 @@ jobs:
       - env:
           CTYUN_USER: ${{ secrets.CTYUN_USER }}
           CTYUN_PASS: ${{ secrets.CTYUN_PASS }}
+          # 自动兑换配置（redeemConfig JSON，见 README）。Secret 不存在时 GitHub 传空串，
+          # cli.js 按未配置处理：兑换跳过，不报错退出，其他三项任务不受影响。
+          CTYUN_REDEEM: ${{ secrets.CTYUN_REDEEM }}
         run: node cli.js
