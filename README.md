@@ -29,10 +29,10 @@ GitHub Actions（daily.yml）所需 Secrets：
 
 `CTYUN_REDEEM` 是 redeemConfig 的 JSON 字符串，与 dashboard 里账号的 `redeemConfig` 同格式。配好后，每天早班（08:00 CST）跑到兑换日就会真实下单；晚班（20:00）不执行兑换，防同一天重复下单（Actions 无持久化配置，`lastRedeemDate` 写不回去，只允许早班兑一次）。
 
-示例（每月最后一天兑 8C16G升配包 1 天，500 积分）：
+示例（每月最后一天兑 1G数据盘永久扩容，1200 积分）：
 
 ```json
-{"enabled":true,"targetType":"redeem","desktopId":"","desktopName":"","prodId":17023101,"prodName":"8C16G升配包1天 (500积分)","prodType":"pointstplupgrade","costPoints":500,"maxRedeemTimes":1,"scheduleType":"monthly_days","monthlyDays":[-1],"intervalDays":1,"pointType":1,"lastRedeemDate":""}
+{"enabled":true,"targetType":"redeem","desktopId":"","desktopName":"","prodId":17024101,"prodName":"1G数据盘永久扩容 (1200积分)","prodType":"pointsdiskupgrade","costPoints":1200,"maxRedeemTimes":1,"scheduleType":"monthly_days","monthlyDays":[-1],"intervalDays":1,"pointType":1,"lastRedeemDate":""}
 ```
 
 关键字段：
