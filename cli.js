@@ -16,6 +16,7 @@
 
 const { CtYunClient } = require('./server.js');
 const { executeNativeSign, executeNativeAiChat, executeNativeHang } = require('./app/tasks/native_tasks.js');
+const { executeRedeem, isRedeemRunAllowed } = require('./app/tasks/redeem_task.js');
 // 深查第 12 轮：challenge 响应码用 task_center 的归一化判定（数字/字符串同义）。
 // 旧实现 `chal.json.code !== 0` 只认数字，challenge 回 `{code:"0"}` 时整班
 // 每日任务在登录第一步即 exit 1，签到/AI/挂机一个都跑不起来。
@@ -153,12 +154,38 @@ async function main() {
     results.hang = r.isCompleted ? '今日已满1小时' : (r.message || '已调度');
   } catch (e) { results.hang = `异常: ${e.message}`; onLog('Main', `挂机异常: ${e.message}`, 'error'); }
 
-  // —— 4. 自动兑换：暂不执行 ——
-  // 原因：dashboard 的兑换是配置驱动的（acc.redeemConfig：商品 prodId、绑定机器、每月哪天兑），
-  // Actions 环境没有这份配置，硬编码商品 ID 下单有误兑风险。待用户在 dashboard 配好兑换策略后，
-  // 把 redeemConfig 以 JSON 形式加为 CTYUN_REDEEM Secret，再补上这一步。
-  results.redeem = '跳过（需 dashboard 兑换配置，见文件头说明）';
-  onLog('Main', '自动兑换：本次跳过（需要 dashboard 的 redeemConfig，硬编码下单有误兑风险）', 'warning');
+  // —— 4. 自动兑换（配置驱动；无 CTYUN_REDEEM Secret 时跳过） ——
+  // 配置来源：GitHub Secrets 的 CTYUN_REDEEM（redeemConfig JSON，见 README）。
+  // 无 Secret / JSON 非法 / 未到兑换日 / 积分不足时均跳过，不下单、不报错退出，
+  // 其他三项任务的结果不受影响。编排与下单复用 app/tasks/redeem_task.js 与
+  // redeem_order.attemptRedeemOrder（S11 安全重试口径），此处不写下单逻辑。
+  try {
+    const rawRedeem = process.env.CTYUN_REDEEM;
+    if (!rawRedeem || !rawRedeem.trim()) {
+      results.redeem = '跳过（未配置 CTYUN_REDEEM Secret）';
+      onLog('Redeem', '自动兑换跳过：未配置 CTYUN_REDEEM Secret（redeemConfig JSON），其他任务不受影响', 'warning');
+    } else {
+      let redeemConfig = null;
+      try { redeemConfig = JSON.parse(rawRedeem); } catch (e) { redeemConfig = null; }
+      if (!redeemConfig || typeof redeemConfig !== 'object' || Array.isArray(redeemConfig)) {
+        results.redeem = '跳过（CTYUN_REDEEM 不是合法 JSON 对象）';
+        onLog('Redeem', '自动兑换跳过：CTYUN_REDEEM 不是合法 JSON 对象', 'error');
+      } else if (!isRedeemRunAllowed(process.env.GITHUB_EVENT_NAME, new Date().getUTCHours())) {
+        // 防同一天重复兑换：daily.yml 每天跑两班（08:00 / 20:00 CST），而 Actions
+        // 无持久化配置，lastRedeemDate 写不回去；只允许早班（UTC 0 点）执行兑换。
+        results.redeem = '跳过（晚班不执行兑换，防同一天重复下单）';
+        onLog('Redeem', '自动兑换跳过：本次为晚班（20:00）定时跑，兑换只在早班（08:00）执行，防同一天重复下单', 'info');
+      } else {
+        const r = await executeRedeem(client, acc, redeemConfig, onLog);
+        if (r.status === 'success') results.redeem = r.message;
+        else if (r.status === 'completed') results.redeem = '今日已兑换';
+        else if (r.status === 'skipped') results.redeem = `跳过（${r.message}）`;
+        else if (r.status === 'unknown') results.redeem = `结果不明确：${r.message}`;
+        else if (r.status === 'risk_blocked') results.redeem = `已中止：${r.message}`;
+        else results.redeem = `失败：${r.message}`;
+      }
+    }
+  } catch (e) { results.redeem = `异常: ${e.message}`; onLog('Redeem', `自动兑换异常: ${e.message}`, 'error'); }
 
   onLog('Main', `汇总: ${JSON.stringify(results)}`, 'success');
   process.exit(0);
