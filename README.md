@@ -23,6 +23,34 @@ GitHub Actions（daily.yml）所需 Secrets：
 | --- | --- |
 | `CTYUN_USER` | 天翼云账号（手机号），仅注入 `node cli.js` 步骤 |
 | `CTYUN_PASS` | 天翼云账号密码，同上 |
+| `CTYUN_REDEEM` | 自动兑换配置（redeemConfig JSON，见下节）；不配时兑换跳过，其他任务不受影响 |
+
+## 自动兑换配置（CTYUN_REDEEM）
+
+`CTYUN_REDEEM` 是 redeemConfig 的 JSON 字符串，与 dashboard 里账号的 `redeemConfig` 同格式。配好后，每天早班（08:00 CST）跑到兑换日就会真实下单；晚班（20:00）不执行兑换，防同一天重复下单（Actions 无持久化配置，`lastRedeemDate` 写不回去，只允许早班兑一次）。
+
+示例（每月最后一天兑 8C16G升配包 1 天，500 积分）：
+
+```json
+{"enabled":true,"targetType":"redeem","desktopId":"","desktopName":"","prodId":17023101,"prodName":"8C16G升配包1天 (500积分)","prodType":"pointstplupgrade","costPoints":500,"maxRedeemTimes":1,"scheduleType":"monthly_days","monthlyDays":[-1],"intervalDays":1,"pointType":1,"lastRedeemDate":""}
+```
+
+关键字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `prodId` / `prodName` / `prodType` / `costPoints` | 商品 ID / 名称 / 类型 / 单价积分。常用：17023101 是 8C16G升配包1天（500 积分），17023111 是 16C32G升配包1天（1000 积分），17024101 是 1G数据盘永久扩容（1200 积分）；`prodType` 对应 `pointstplupgrade` / `pointsdiskupgrade` |
+| `desktopId` / `desktopName` | 升配/扩容类商品必须绑定的目标云电脑。`desktopId` 从 dashboard 账号页绑定的云电脑取（账号详情里显示的云电脑 ID）；填了才会下单，找不到有效设备时本次跳过，不会误兑 |
+| `scheduleType` / `monthlyDays` / `intervalDays` | 兑换周期：`monthly_days`（默认，按 `monthlyDays` 里的日期兑，`-1` 代表月末最后一天）/ `daily`（每天）/ `interval_days`（按 `intervalDays` 间隔天数兑） |
+| `maxRedeemTimes` | 单次兑换份数（总价 = `costPoints × maxRedeemTimes`，单笔下单一次扣完） |
+| `lastRedeemDate` | 上次兑换日期（`YYYY-MM-DD`），当天已兑过会跳过；留空表示从未兑过 |
+| `enabled` | `false` 时不兑换；不填视为启用（建了这个 Secret 即表示要开兑换） |
+
+行为说明：
+
+- 没配 `CTYUN_REDEEM`、JSON 非法、未到兑换日、积分不足、需绑定云电脑但无有效 `desktopId` 时，本次兑换跳过并写明原因，签到/AI/挂机照常跑，workflow 不会因此失败。
+- 下单用与 dashboard 相同的 S11 安全重试口径：明确业务错误才有限重试；网络异常等结果不明确时绝不重试，汇总里会标“结果不明确，请人工核对订单与积分变动”。
+- 成功后请把兑换日期填回 `CTYUN_REDEEM` 的 `lastRedeemDate`（Actions 写不回去）；月末策略下月仍会正常触发，符合预期。
 
 仪表盘服务（server.js）关键环境变量：
 
