@@ -6,9 +6,10 @@ on:
     - cron: '0 12 * * *'  # 20:00 Asia/Shanghai
   workflow_dispatch:
 
-# G10: minimal permissions - workflow only needs to read code; secrets come via env
+# G10: 最小权限——兑换成功后要把 redeem-state.json 的变化推回仓库，
+# 所以 contents 需要 write（只为回写兑换日期这一个用途）；secrets 仍经 env 传入。
 permissions:
-  contents: read
+  contents: write
 
 # G10: prevent overlapping runs against the same account
 # 2026-11-12 审计：cancel-in-progress 保持 false —— 定时任务绝不能中途取消。
@@ -43,3 +44,19 @@ jobs:
           # cli.js 按未配置处理：兑换跳过，不报错退出，其他三项任务不受影响。
           CTYUN_REDEEM: ${{ secrets.CTYUN_REDEEM }}
         run: node cli.js
+      # 回写兑换日期：node cli.js 兑换成功后会把当天日期写进 redeem-state.json，
+      # 这一步把文件变化 commit 并推回 main 分支，下次跑就能读到最新日期。
+      # 文件没变化时不提交、不报错。
+      - name: 回写兑换日期 (redeem-state.json)
+        run: |
+          if [ -z "$(git status --porcelain -- redeem-state.json)" ]; then
+            echo "redeem-state.json 无变化，跳过回写"
+            exit 0
+          fi
+          DATE_STR=$(node -e "console.log(JSON.parse(require('fs').readFileSync('redeem-state.json','utf8')).lastRedeemDate || '')" 2>/dev/null || echo "")
+          if [ -z "$DATE_STR" ]; then DATE_STR=$(TZ=Asia/Shanghai date +%F); fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add redeem-state.json
+          git commit -m "chore: 更新兑换日期到 ${DATE_STR}"
+          git push
