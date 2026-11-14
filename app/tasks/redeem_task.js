@@ -9,16 +9,19 @@
 * getAccounts/getSettings/saveConfig/通知 wiring，Actions 环境不需要）。
 *
 * Actions 环境与 dashboard 的关键差异：
-* - 无持久化配置：成功后 lastRedeemDate 写不回去，下次跑仍是旧值。daily.yml
-* 每天跑两班（08:00 / 20:00 CST），同一天两班都会命中同一兑换日 → 必须用
-* isRedeemRunAllowed 限流：定时跑只允许早班（UTC 0 点，即 08:00 CST）执行
-* 兑换，晚班跳过；手动 workflow_dispatch 不受限。
+* - 持久化靠仓库根目录的 redeem-state.json：兑换成功后 cli.js 把当天日期
+* 写进该文件，daily.yml 再把它 commit 推回 main 分支；下次跑先读文件里的
+* lastRedeemDate 覆盖 Secret 里的同字段。GitHub Actions 无法更新 Secret，
+* 所以日期不走 Secret 回写。isRedeemRunAllowed 的早班限流仍保留做兜底
+* （万一回写推不上去，晚班也不会在同一天再兑一次）。
 * - 积分取 client.metrics.userPoints（executeNativeSign 开头已调
 * refreshOfficialTasks 刷新）；取不到（0）时不做预检，交给服务端判定，
 * 与 dashboard 手动下单接口（server.js /api/accounts/:id/order）同口径。
 */
 
 const { attemptRedeemOrder} = require('./redeem_order');
+const fs = require('fs');
+const path = require('path');
 
 const PLACE_ORDER_URL = 'https://desk.ctyun.cn/selforder/api/selforder/paas/placeOrder';
 
@@ -29,6 +32,60 @@ const DESKTOP_BOUND_PROD_TYPES = ['pointstplupgrade', 'pointsdiskupgrade'];
 function getBeijingDateStr() {
 const d = new Date();
 return d.toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai'});
+}
+
+// 兑换日期状态文件：仓库根目录 redeem-state.json，内容 {"lastRedeemDate": "YYYY-MM-DD"}。
+// 它是 lastRedeemDate 的唯一事实来源：cli.js 每次跑先读它覆盖 Secret 里的同字段，
+// 兑换成功后把当天日期写回，daily.yml 再把文件变化 commit 推回 main 分支。
+const REDEEM_STATE_FILENAME = 'redeem-state.json';
+
+// 默认状态文件路径：本文件在 app/tasks/，上两级即仓库根目录。
+function defaultRedeemStatePath() {
+return path.join(__dirname, '..', '..', REDEEM_STATE_FILENAME);
+}
+
+/**
+* 读兑换状态文件。文件不存在 / JSON 非法 / 不是对象时返回 null（调用方沿用 Secret 的值）。
+* 绝不抛错。
+*/
+function readRedeemState(statePath) {
+const p = statePath || defaultRedeemStatePath();
+try {
+const data = JSON.parse(fs.readFileSync(p, 'utf8'));
+if (data && typeof data === 'object' && !Array.isArray(data)) return data;
+return null;
+} catch {
+return null;
+}
+}
+
+/**
+* 把状态文件里的 lastRedeemDate 合并进 redeemConfig（返回新对象，不改原配置）。
+* 文件里的日期优先；文件不存在/不合法、或文件里没记日期（空串）时沿用 Secret 的值。
+* 空串视为“没记过”：只在首次部署、文件还是初始值时才出现，此时 Secret 里若有人
+* 工填过的日期应继续生效，避免同一天重复兑换。
+*/
+function applyRedeemState(redeemConfig, statePath) {
+const merged = { ...(redeemConfig || {}) };
+const state = readRedeemState(statePath);
+if (state && typeof state.lastRedeemDate === 'string' && state.lastRedeemDate) {
+merged.lastRedeemDate = state.lastRedeemDate;
+}
+return merged;
+}
+
+/**
+* 把日期写回状态文件。写失败只记一条警告并返回 false，绝不抛错、不影响兑换结果判定。
+*/
+function writeRedeemState(dateStr, statePath, onLog) {
+const p = statePath || defaultRedeemStatePath();
+try {
+fs.writeFileSync(p, JSON.stringify({ lastRedeemDate: dateStr }) + '\n', 'utf8');
+return true;
+} catch (e) {
+if (typeof onLog === 'function') onLog('Redeem', `回写 ${REDEEM_STATE_FILENAME} 失败（不影响本次兑换结果）: ${e.message}`, 'warning');
+return false;
+}
 }
 
 /**
@@ -157,9 +214,8 @@ onLog('Redeem', `[${accName}] 第 ${attempt} 次自动兑换未成功: ${info.ms
 
 if (orderResult.status === 'success') {
 onLog('Redeem', `[${accName}] ✅ 成功完成x${buyTimes} 自动兑换，共消耗 ${totalCost} 积分！`, 'success');
-// 注意：Actions 环境无持久化配置，lastRedeemDate 写不回去；同一天防重复靠
-// isRedeemRunAllowed（只允许早班执行）。下次跑之前请把本次兑换日期填回
-// CTYUN_REDEEM 的 lastRedeemDate，否则月末策略下月仍会正常触发（符合预期）。
+// lastRedeemDate 的回写由 cli.js 做（writeRedeemState 写 redeem-state.json，
+// daily.yml 再推回仓库）；这里只返回成功状态，不碰文件。
 return { status: 'success', message: `成功兑换x${buyTimes}，共消耗 ${totalCost} 积分`, costPoints: totalCost, times: buyTimes, prodName};
 }
 if (orderResult.status === 'risk_blocked') {
@@ -174,4 +230,4 @@ onLog('Redeem', `[${accName}] 自动兑换失败: ${orderResult.msg}`, 'error');
 return { status: 'failed', message: orderResult.msg};
 }
 
-module.exports = { executeRedeem, isRedeemDueToday, isRedeemRunAllowed, rewardNeedsDesktop, getBeijingDateStr};
+module.exports = { executeRedeem, isRedeemDueToday, isRedeemRunAllowed, rewardNeedsDesktop, getBeijingDateStr, readRedeemState, applyRedeemState, writeRedeemState };
