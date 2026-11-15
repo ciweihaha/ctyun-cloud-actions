@@ -39,6 +39,9 @@ const { isTaskCenterExpired, isTaskListOk, isPointsOk, normalizeBusinessCode } =
 const { SohoClient } = require('./app/ydpc/soho_client');
 const { performCagAuthHold } = require('./app/ydpc/cag_client');
 const { YdpcClient } = require('./app/ydpc/ydpc_client');
+// 【审查修复 M1】保活 WebSocket 复用 cag_boot 的受控降级判定：默认严格校验 TLS，
+// 仅证书链缺陷类错误才降级重试（cag_boot 只依赖 Node 内置模块，无循环引用）。
+const { isCertChainError } = require('./app/ydpc/cag_boot');
 const { EcloudClient, LOG_SOURCE: ECLOUD_LOG_SOURCE, INTERACTIVE_BRANCHES } = require('./app/ecloud/ecloud_client');
 const { LogPersister } = require('./app/persist_log');
 
@@ -504,6 +507,41 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 15000) {
   }
 }
 
+// 【审查修复 H1/L2/L3】拼进 HTML 前必须转义用户可控内容（账号名、上游错误信息、
+// 管理员设置的标题）：`</title><script>` 这类输入否则可跳出上下文执行脚本。
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+// 【审查修复 H1】注入 <script> 的 JSON 必须转义 `<`（及 U+2028/2029）：
+// JSON.stringify 不转义 `</script>`，含该序列的上游昵称可直接跳出 script 块。
+function safeJsonForScript(obj) {
+  return JSON.stringify(obj)
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/&/g, '\\u0026')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
+}
+
+// 【审查修复 H1 纵深防御】账号名白名单：长度上限 50，拒绝可破出 HTML 上下文的
+// `<`/`>`（输出侧 escapeHtml 是主防线，此处是第二道）。返回错误文案或 null。
+function validateAccountName(name) {
+  if (typeof name !== 'string') return null;
+  const n = name.trim();
+  if (n.length > 50) return '账号名称过长（最多 50 个字符）';
+  if (n.includes('<') || n.includes('>')) return '账号名称不能包含 < 或 > 字符';
+  return null;
+}
+
+// 【审查修复 H1】导入路径不因单个坏名字失败整个导入：去掉 < > 并截断到 50 字符。
+function sanitizeImportedAccountName(name, fallback) {
+  const n = String(name || fallback || '').replace(/[<>]/g, '').trim().slice(0, 50);
+  return n || String(fallback || '');
+}
+
 function sha256(str) {
   return crypto.createHash('sha256').update(str).digest('hex').toLowerCase();
 }
@@ -963,6 +1001,19 @@ function loadConfig() {
     cfg.accounts.forEach(a => {
       if (!a.ownerId) a.ownerId = 'u_admin';
       if (!a.platform) a.platform = 'ctyun';
+      // 【审查修复 L6】归一化缺失的 stats：手改配置/旧备份导入的账号若无 stats，
+      // refreshOfficialTasks / scheduleSignVerify / runCycleLoop catch 会抛 TypeError。
+      // 默认值与导入路由（/api/config/import）同一模板；已有字段原样保留。
+      a.stats = {
+        lastSignTime: '',
+        lastAiChatTime: '',
+        lastHangTime: '',
+        hangMinutesToday: 0,
+        points: 0,
+        keepAliveStatus: 'offline',
+        lastError: '',
+        ...(a.stats || {})
+      };
       if (a.password) a.password = decryptPassword(a.password);
     });
 
@@ -990,6 +1041,12 @@ function loadConfig() {
   saveConfig(defaultCfg);
   return defaultCfg;
 }
+
+// 【审查修复 L17】.bak 节流：saveConfig 在续期/统计变更等热路径上频繁触发，
+// 每次都全量重写主配置 + .bak + accounts.json 三个文件。.bak 只是崩溃恢复用的
+// 备份，允许最多 60 秒的滞后，节流后热路径每次只写主配置与 accounts.json。
+let lastBakWriteAt = 0;
+const BAK_WRITE_MIN_INTERVAL_MS = 60 * 1000;
 
 function saveConfig(cfg) {
   try {
@@ -1038,11 +1095,15 @@ function saveConfig(cfg) {
     // 1. 原子写入主配置文件 (防崩溃/防断电截断)
     atomicWriteFileSync(CONFIG_FILE, jsonStr, 'utf8', 0o600);
 
-    // 2. 自动同步持久化备份文件 (app_config.json.bak)
+    // 2. 自动同步持久化备份文件 (app_config.json.bak)，按 60 秒节流（见 L17 注释）。
+    // 主配置每次必写，.bak 滞后不影响崩溃恢复（loadConfig 会从 .bak 恢复后回写）。
     if (Array.isArray(diskClone.accounts) || Array.isArray(diskClone.users)) {
       try {
-        const BAK_FILE = CONFIG_FILE + '.bak';
-        atomicWriteFileSync(BAK_FILE, jsonStr, 'utf8', 0o600);
+        if (Date.now() - lastBakWriteAt >= BAK_WRITE_MIN_INTERVAL_MS) {
+          const BAK_FILE = CONFIG_FILE + '.bak';
+          atomicWriteFileSync(BAK_FILE, jsonStr, 'utf8', 0o600);
+          lastBakWriteAt = Date.now();
+        }
       } catch (e) {}
     }
 
@@ -1192,9 +1253,13 @@ class CtYunClient {
     this.webUserActiveUntil = 0;
     this.externalYieldUntil = 0; // 官方客户端抢占避让截止时间戳
     this.lastTokenRenewAt = Date.now();
+    // 【审查修复 M7】续期 in-flight 共享 Promise + 失败退避时间戳
+    this._renewTokenPromise = null;
+    this._renewTokenFailedAt = 0;
     this.isTaskHanging = false; // 是否正在执行 Scheduler 精准调度的 1 小时挂机任务
     this.hangRetryTimer = null; // 挂机任务自动重试定时器 (未达标自愈续跑)
     this.hangRetryCount = 0;    // 当日挂机重试次数 (上限 24 次)
+    this.hangRetryDate = '';    // 【审查修复 M6】计数所属的北京日期，跨日自动清零
     this.hangReconnectCount = 0;      // 单次 runHangTask 内的"经证据鉴别后允许重连"次数 (上限 3)
     this.hangUnverifiedStreak = 0;    // 连续"取不到证据"的次数：达到阈值后退避更久，避免任何形式的顶人风暴
     this.signVerifyTimer = null;      // 打卡"待官方确认"复检定时器
@@ -1244,6 +1309,13 @@ class CtYunClient {
     if (this.hangRetryTimer) clearTimeout(this.hangRetryTimer);
     if (this.account.features?.cloudHang === false) return;
     if (this.account.enabled === false) return;
+    // 【审查修复 M6】按北京日期复位计数：旧实现只在任务达成/关开关时复位，
+    // 某天耗尽 24 次后之后每天的自愈重试都被永久禁用，与"当日 24 次"注释不符。
+    const todayStr = getBeijingDateOnly();
+    if (this.hangRetryDate !== todayStr) {
+      this.hangRetryDate = todayStr;
+      this.hangRetryCount = 0;
+    }
     if (this.hangRetryCount >= 24) {
       onLog('Hang', `[${accName}] 今日挂机自动重试已达上限 (24 次)，为避免夜间无谓重试已停止续跑，明日调度将自动执行。`, 'info');
       return;
@@ -1469,7 +1541,9 @@ class CtYunClient {
       clientVersion: this.version
     });
 
-    const loginRes = await fetch('https://desk.ctyun.cn:8810/api/auth/client/login', {
+    // 【审查修复 M5】旧实现裸 fetch 无超时：上游挂起时登录永久不返回，
+    // Actions 每日任务只能靠 workflow 超时兜底。统一改用 fetchWithTimeout（30 秒）。
+    const loginRes = await fetchWithTimeout('https://desk.ctyun.cn:8810/api/auth/client/login', {
       method: 'POST',
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/137.0.0.0',
@@ -1480,7 +1554,7 @@ class CtYunClient {
         'Content-Type': 'application/x-www-form-urlencoded'
       },
       body: body.toString()
-    });
+    }, 30000);
 
     const result = await loginRes.json();
     if (normalizeBusinessCode(result.code) === 0 && result.data) {
@@ -1525,7 +1599,33 @@ class CtYunClient {
   }
 
   // 无感静默轮转刷新 Token (通过现有会话生成免密票据并重新登录换取全新凭据，彻底杜绝会话失效)
+  // 【审查修复 M7】互斥 + 失败退避：旧实现无锁，续期失败时 runCycleLoop 每轮
+  // （约数十秒）都会再触发一次，且与 getDesktops / refreshOfficialTasks / AI 对话
+  // 的续期调用并发交错，多次 genLoginToken + loginByToken 竞争写 loginInfo 并
+  // saveConfig，可能互相作废 token。现并发调用共享同一次续期；失败后 5 分钟
+  // 内不再重试（退避错误带 isRenewBackoff 标记，调用方不得据此判会话失效）。
   async renewToken() {
+    if (this._renewTokenPromise) return this._renewTokenPromise;
+    if (this._renewTokenFailedAt && Date.now() - this._renewTokenFailedAt < 5 * 60 * 1000) {
+      const err = new Error('续期失败退避中（5 分钟内不再重试）');
+      err.isRenewBackoff = true;
+      throw err;
+    }
+    const p = this._renewTokenOnce();
+    this._renewTokenPromise = p;
+    try {
+      const r = await p;
+      this._renewTokenFailedAt = 0;
+      return r;
+    } catch (e) {
+      this._renewTokenFailedAt = Date.now();
+      throw e;
+    } finally {
+      if (this._renewTokenPromise === p) this._renewTokenPromise = null;
+    }
+  }
+
+  async _renewTokenOnce() {
     if (!this.loginInfo) {
       throw new Error('账号尚未登录，无法续期');
     }
@@ -1582,7 +1682,13 @@ class CtYunClient {
         if (newInfo) {
           return { success: true, data: newInfo };
         }
-      } catch (e) {}
+      } catch (e) {
+        // 【审查修复 M7】退避中的续期失败不等于会话失效：直接返回失败由调用方
+        // 稍后重试，不得调用 handleSessionExpired（会停用重试并告警）。
+        if (e && e.isRenewBackoff) {
+          return { success: false, error: '续期失败退避中，稍后重试' };
+        }
+      }
     }
     this.handleSessionExpired('会话已过期，需要人工验证登录');
     return { success: false, error: '会话已过期，请在控制台输入验证码重新登录！' };
@@ -1955,7 +2061,11 @@ class CtYunClient {
         } else if (normalizeBusinessCode(json.code) === 40010 || String(json.msg || '').includes('登录信息已过期') || String(json.msg || '').includes('会话已过期')) {
           isAuthExpired = true;
         }
-      } catch (e) {}
+      } catch (e) {
+        // 【审查修复 L15】旧实现静默吞错：两个桌面接口都失败时排障无据。
+        // 只记 warning（另一接口仍可能成功），不改变合并/重试逻辑。
+        appendLog('KeepAlive', `[${this.account.name || this.account.user}] pageDesktop 查询异常: ${e.message}`, 'warning');
+      }
 
       // 2. 官方备用接口合并：api/desktop/client/list (覆盖所有自建、公有池与专属云电脑类型)
       try {
@@ -1976,7 +2086,10 @@ class CtYunClient {
         } else if (normalizeBusinessCode(jsonList.code) === 40010 || String(jsonList.msg || '').includes('登录信息已过期') || String(jsonList.msg || '').includes('会话已过期')) {
           isAuthExpired = true;
         }
-      } catch (e) {}
+      } catch (e) {
+        // 【审查修复 L15】见上：备用 list 接口异常同样留证。
+        appendLog('KeepAlive', `[${this.account.name || this.account.user}] 备用 list 查询异常: ${e.message}`, 'warning');
+      }
 
       if (mergedList.length > 0) {
         // 差量合并引擎 (Diff-Merge)：保留用户本地已设置的单机保活与任务偏好
@@ -2008,6 +2121,9 @@ class CtYunClient {
           await this.renewToken();
           continue; // 用新凭据重试
         } catch (e) {
+          // 【审查修复 M7】退避中的续期失败不等于会话失效：只中断本轮，
+          // 不调用 handleSessionExpired（会停用重试并告警）。
+          if (e && e.isRenewBackoff) break;
           this.handleSessionExpired('登录凭据已过期，自动续期失败');
           break;
         }
@@ -2353,7 +2469,14 @@ class CtYunClient {
   startKeepAliveWorker() {
     if (this.workerRunning) return;
     this.workerRunning = true;
-    this.runCycleLoop();
+    // 【审查修复 M8】runCycleLoop 是 async 循环：若其内部抛错逃出 while
+    // （如 catch 块自身抛错），Promise 变成未处理拒绝、循环终止，但
+    // workerRunning 仍为 true 导致永远无法重新拉起。此处挂 .catch 兜底：
+    // 记日志并复位 workerRunning，下一轮调度可重新拉起。
+    this.runCycleLoop().catch((err) => {
+      this.workerRunning = false;
+      appendLog('KeepAlive', `[${this.account.name || this.account.user}] 保活循环意外终止（已复位 workerRunning，等待重新拉起）: ${(err && err.message) || err}`, 'error');
+    });
   }
 
   stopKeepAliveWorker() {
@@ -2489,10 +2612,16 @@ class CtYunClient {
         }
       }, 1000);
 
-      this.ws = new WebSocket(wsUrl, {
+      // 【审查修复 M1】默认严格校验 TLS：旧实现无条件 rejectUnauthorized:false，
+      // 保活/挂机长连接承载 Type 112/104 登录认领凭据，中间人可窃取会话。
+      // 复用 cag_boot 的受控降级模式：仅当握手失败且错误属于证书链缺陷类时，
+      // 在 error 处理里留证后降级重试一次（见 attachWsHandlers 的 error 分支）。
+      let tlsDowngraded = false;
+      const createWs = (allowInsecure) => new WebSocket(wsUrl, {
         headers: { Origin: 'https://pc.ctyun.cn' },
-        rejectUnauthorized: false
+        ...(allowInsecure ? { rejectUnauthorized: false } : {})
       });
+      this.ws = createWs(false);
 
       const safeSend = (data) => {
         try {
@@ -2504,6 +2633,8 @@ class CtYunClient {
         }
       };
 
+      // 【审查修复 M1】四个处理器包成函数：TLS 降级重试时需在新 socket 上重新挂载。
+      const attachWsHandlers = () => {
       this.ws.on('open', () => {
         wsConnectedAt = Date.now();
         this.sessionConflictStreak = 0;
@@ -2733,6 +2864,22 @@ class CtYunClient {
       });
 
       this.ws.on('error', (err) => {
+        // 【审查修复 M1】受控降级：严格校验下、尚未 open 且错误属于证书链缺陷类时，
+        // 打 warning 留证后用不校验重建一次连接（仅一次）；其余错误按原口径结束会话。
+        // ws 库的 TLS 握手失败以 error 事件上报，证书错误码在 err 或其 cause 链上，
+        // isCertChainError 会沿 cause 链查找（与 cag_boot 同口径）。
+        if (!tlsDowngraded && wsConnectedAt === 0) {
+          const certCode = isCertChainError(err);
+          if (certCode) {
+            tlsDowngraded = true;
+            appendLog('Heartbeat', `[${accName}][${desktopName}] ⚠️ 保活 WebSocket TLS 证书链校验失败 (${certCode})，已留证并降级重试一次（网关证书链缺陷，见 cag_boot 受控降级策略）`, 'warning');
+            try { this.ws.removeAllListeners(); } catch (e) {}
+            try { this.ws.terminate(); } catch (e) {}
+            this.ws = createWs(true);
+            attachWsHandlers();
+            return;
+          }
+        }
         appendLog('Heartbeat', `[${accName}][${desktopName}] 通道异常: ${err.message || '连接受阻'}`, 'error');
         this.metrics.errorCount++;
         endSession('Socket Error');
@@ -2777,6 +2924,9 @@ class CtYunClient {
         appendLog('Heartbeat', `[${accName}][${desktopName}] 通道被网关断开 (状态码: ${code}，已保持 ${heldSec} 秒)，但未收到任何客户端在席证据 (无 119/120/137 且 code 未达 4000)。此事不构成"无人在用"的结论，交由上层做证据鉴别后再决定是否重连。`, 'warning');
         endSession('Unverified Channel Close');
       });
+      };
+
+      attachWsHandlers();
     });
   }
 
@@ -3198,7 +3348,10 @@ class CtYunClient {
         appendLog('KeepAlive', `[${accName}] 保活异常: ${err.message}，10秒后重试...`, 'error');
         this.metrics.status = 'offline';
         this.metrics.lastHeartbeatResult = `异常: ${err.message}`;
-        this.account.stats.keepAliveStatus = 'offline';
+        // 【审查修复 M8】catch 块自身不得抛错：缺 stats 的账号在此抛 TypeError
+        // 会让 runCycleLoop 的 Promise 变成未处理拒绝、循环永久死亡。
+        // 与本循环其他 stats 写入口径一致，先判空再写。
+        if (this.account.stats) this.account.stats.keepAliveStatus = 'offline';
         saveConfig(appConfig);
 
         sendAccountNotification(
@@ -3375,11 +3528,14 @@ function serveStatic(res, filePath, contentType) {
       // 若返回 HTML，动态将当前最新的系统主标题与副标题注入模板，杜绝页面刷新时回跳闪烁！
       if (contentType.includes('text/html')) {
         let htmlStr = data.toString('utf8');
-        const currentTitle = appConfig.settings?.systemTitle || '天翼云/移动云电脑保活签到中心';
-        const currentSubtitle = appConfig.settings?.systemSubtitle || '多账号长连接保活守护 · 多运营商支持 · 每日签到打卡 · 智能挂机';
-        htmlStr = htmlStr.replace(/<h1 id="main-system-title">[^<]*<\/h1>/, `<h1 id="main-system-title">${currentTitle}<\/h1>`);
-        htmlStr = htmlStr.replace(/(<p style="font-size: 13px; color: var\(--text-muted\); margin-top: 2px;">)[^<]*(<\/p>)/, `$1${currentSubtitle}$2`);
-        htmlStr = htmlStr.replace(/<title>[^<]*<\/title>/, `<title>${currentTitle} - 多账号保活控制台<\/title>`);
+        // 【审查修复 L2】标题/副标题是管理员可设字段：旧实现未转义注入 HTML，
+        // 属 admin-to-admin 存储型 XSS。转义后注入；同时改用替换函数，避免
+        // 标题含 `$&`/`$'` 等序列时被 String.replace 当作替换模式展开。
+        const currentTitle = escapeHtml(appConfig.settings?.systemTitle || '天翼云/移动云电脑保活签到中心');
+        const currentSubtitle = escapeHtml(appConfig.settings?.systemSubtitle || '多账号长连接保活守护 · 多运营商支持 · 每日签到打卡 · 智能挂机');
+        htmlStr = htmlStr.replace(/<h1 id="main-system-title">[^<]*<\/h1>/, () => `<h1 id="main-system-title">${currentTitle}<\/h1>`);
+        htmlStr = htmlStr.replace(/(<p style="font-size: 13px; color: var\(--text-muted\); margin-top: 2px;">)[^<]*(<\/p>)/, (m, p1, p2) => `${p1}${currentSubtitle}${p2}`);
+        htmlStr = htmlStr.replace(/<title>[^<]*<\/title>/, () => `<title>${currentTitle} - 多账号保活控制台<\/title>`);
         content = Buffer.from(htmlStr, 'utf8');
       }
       res.writeHead(200, {
@@ -3415,7 +3571,26 @@ function getSessionFromReq(req, parsedUrl = null) {
 }
 
 // 缓存与代理天翼云电脑官方 Web 资产与模板
+// 【审查修复 L10】旧实现 Map 永不淘汰、无超时、无响应体上限，长期运行内存缓慢增长。
+// 现加 LRU 上限：最多 50 项且总字节 ≤100MB，超限淘汰最久未用项（Map 按插入序，
+// 命中时 delete+set 刷新为最新；单项仍沿用下方 20MB 缓存门槛）。
 const ctyunStaticCache = new Map();
+const CTYUN_STATIC_CACHE_MAX_ENTRIES = 50;
+const CTYUN_STATIC_CACHE_MAX_BYTES = 100 * 1024 * 1024;
+let ctyunStaticCacheBytes = 0;
+function ctyunStaticCacheSet(url, entry) {
+  if (ctyunStaticCache.has(url)) {
+    ctyunStaticCacheBytes -= ctyunStaticCache.get(url).buffer.length;
+    ctyunStaticCache.delete(url);
+  }
+  ctyunStaticCache.set(url, entry);
+  ctyunStaticCacheBytes += entry.buffer.length;
+  while ((ctyunStaticCache.size > CTYUN_STATIC_CACHE_MAX_ENTRIES || ctyunStaticCacheBytes > CTYUN_STATIC_CACHE_MAX_BYTES) && ctyunStaticCache.size > 0) {
+    const oldestKey = ctyunStaticCache.keys().next().value;
+    ctyunStaticCacheBytes -= ctyunStaticCache.get(oldestKey).buffer.length;
+    ctyunStaticCache.delete(oldestKey);
+  }
+}
 let cachedCtyunIndexHtml = '';
 let cachedCtyunIndexTime = 0;
 
@@ -3425,7 +3600,8 @@ async function getCtyunIndexHtml() {
     return cachedCtyunIndexHtml;
   }
   try {
-    const res = await fetch('https://pc.ctyun.cn/', {
+    // 【审查修复 M5】裸 fetch 改 fetchWithTimeout（默认 15 秒），防上游挂起。
+    const res = await fetchWithTimeout('https://pc.ctyun.cn/', {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/137.0.0.0'
       }
@@ -3444,6 +3620,9 @@ async function getCtyunIndexHtml() {
 async function proxyStaticAsset(req, res, targetUrl) {
   if (ctyunStaticCache.has(targetUrl)) {
     const cached = ctyunStaticCache.get(targetUrl);
+    // LRU 命中：刷新为最新（Map 插入序决定淘汰顺序）
+    ctyunStaticCache.delete(targetUrl);
+    ctyunStaticCache.set(targetUrl, cached);
     res.writeHead(200, {
       'Content-Type': cached.contentType,
       ...(req ? corsHeadersFor(req, { allowedOrigins: CORS_ALLOWED_ORIGINS }) : {}),
@@ -3454,7 +3633,8 @@ async function proxyStaticAsset(req, res, targetUrl) {
   }
 
   try {
-    const upstreamRes = await fetch(targetUrl, {
+    // 【审查修复 M5/L10】裸 fetch 改 fetchWithTimeout（默认 15 秒），防上游挂起。
+    const upstreamRes = await fetchWithTimeout(targetUrl, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/137.0.0.0',
         'Referer': 'https://pc.ctyun.cn/'
@@ -3475,7 +3655,7 @@ async function proxyStaticAsset(req, res, targetUrl) {
     else if (targetUrl.endsWith('.ico')) contentType = 'image/x-icon';
 
     if (buffer.length < 20 * 1024 * 1024) {
-      ctyunStaticCache.set(targetUrl, { buffer, contentType });
+      ctyunStaticCacheSet(targetUrl, { buffer, contentType });
     }
 
     res.writeHead(200, {
@@ -3601,9 +3781,12 @@ function rewardNeedsDesktop(prodId, prodType) {
 <script>
 (function() {
   // 1. 自动免密注入天翼官方认证凭据至 localStorage
-  const authData = ${JSON.stringify(authDataObj)};
-  const deviceCode = ${JSON.stringify(acc.deviceCode)};
-  const expiredAt = ${JSON.stringify(String(Date.now() + 72 * 3600 * 1000))};
+  // 【审查修复 H1】注入 script 的 JSON 必须经 safeJsonForScript 转义尖括号：
+  // JSON.stringify 不转义 script 闭合标签，上游昵称含该序列即可跳出 script
+  // 块执行脚本，而本页内嵌了管理员会话 token。
+  const authData = ${safeJsonForScript(authDataObj)};
+  const deviceCode = ${safeJsonForScript(acc.deviceCode)};
+  const expiredAt = ${safeJsonForScript(String(Date.now() + 72 * 3600 * 1000))};
   try {
     localStorage.setItem('web_device_code', deviceCode);
     localStorage.setItem('authExpiredAt', expiredAt);
@@ -3622,7 +3805,7 @@ function rewardNeedsDesktop(prodId, prodType) {
   // 【缺陷修复 G6】代理路由已要求仪表盘会话鉴权：重写 URL 时附带当前会话 token
   // （token 只发往本机代理，代理仅取 target 转发，上游永远看不到该参数）。
   const proxyBase = '/api/ctyun-proxy?target=';
-  const proxyToken = ${JSON.stringify(session.token || '')};
+  const proxyToken = ${safeJsonForScript(session.token || '')};
   function rewriteUrl(u) {
     if (!u || typeof u !== 'string') return u;
     if (u.startsWith(proxyBase)) return u;
@@ -3650,7 +3833,7 @@ function rewardNeedsDesktop(prodId, prodType) {
   };
 
   // 4. 路由直接锁定进入云电脑操作界面
-  const targetHash = '#/desktop?id=' + ${JSON.stringify(encodeURIComponent(b64Id))};
+  const targetHash = '#/desktop?id=' + ${safeJsonForScript(encodeURIComponent(b64Id))};
   if (!window.location.hash || window.location.hash.includes('/login') || window.location.hash.includes('/desktop-list')) {
     window.location.hash = targetHash;
   }
@@ -3698,27 +3881,29 @@ function rewardNeedsDesktop(prodId, prodType) {
 
   // 7. 前台网页生命周期与心跳保活双向感知感知探针
   // 打开页面每 5 秒发送心跳证明用户正在操作；页面关闭/离开时立即通知后台恢复保活守护
-  const accId = ${JSON.stringify(acc.id)};
-  const token = ${JSON.stringify(session.token || '')};
+  const accId = ${safeJsonForScript(acc.id)};
+  const token = ${safeJsonForScript(session.token || '')};
+  // 【审查修复 L4】心跳/关闭改走 Authorization 头：旧实现把会话 token 放 URL 查询
+  // 参数，会进浏览器历史与代理日志。sendBeacon 不能自定义请求头，改用 keepalive
+  // fetch 代替（beforeunload 下同样能发出请求）。
   function sendWebHeartbeat() {
-    fetch('/api/accounts/' + accId + '/web-active?token=' + encodeURIComponent(token), { method: 'POST' }).catch(() => {});
+    fetch('/api/accounts/' + accId + '/web-active', { method: 'POST', headers: { 'Authorization': 'Bearer ' + token } }).catch(() => {});
   }
   sendWebHeartbeat();
   const webHbTimer = setInterval(sendWebHeartbeat, 5000);
 
   window.addEventListener('beforeunload', function() {
     clearInterval(webHbTimer);
-    if (navigator.sendBeacon) {
-      navigator.sendBeacon('/api/accounts/' + accId + '/web-close?token=' + encodeURIComponent(token));
-    } else {
-      fetch('/api/accounts/' + accId + '/web-close?token=' + encodeURIComponent(token), { method: 'POST', keepalive: true }).catch(() => {});
-    }
+    fetch('/api/accounts/' + accId + '/web-close', { method: 'POST', keepalive: true, headers: { 'Authorization': 'Bearer ' + token } }).catch(() => {});
   });
 })();
 </script>
 `;
 
-      html = html.replace('<head>', '<head><meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"><title>天翼云电脑 - ' + (acc.name || acc.user) + '</title>' + injectScript);
+      // 【审查修复 H1】账号名是用户可控字段：旧实现直接拼进 <title>，普通用户把
+      // 账号名设为 `</title><script>…` 即可在管理员打开桌面视图时执行脚本，窃取
+      // 本页内嵌的管理员会话 token。现 HTML 转义后再拼接。
+      html = html.replace('<head>', '<head><meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"><title>天翼云电脑 - ' + escapeHtml(acc.name || acc.user) + '</title>' + injectScript);
       html = html.replace(/src="static\//g, 'src="/ctyun-static/static/');
       html = html.replace(/src="\.\/static\//g, 'src="/ctyun-static/static/');
       html = html.replace(/href="\.\/static\//g, 'href="/ctyun-static/static/');
@@ -3735,7 +3920,8 @@ function rewardNeedsDesktop(prodId, prodType) {
       res.end(html);
     } catch (err) {
       res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end('<h3 style="font-family:sans-serif;padding:20px;">连接云电脑服务异常: ' + err.message + '</h3>');
+      // 【审查修复 L3】上游错误信息含 HTML 时可反射型 XSS，转义后输出。
+      res.end('<h3 style="font-family:sans-serif;padding:20px;">连接云电脑服务异常: ' + escapeHtml(err.message) + '</h3>');
     }
     return;
   }
@@ -4484,6 +4670,9 @@ function rewardNeedsDesktop(prodId, prodType) {
     const user = (body.user || '').trim();
     const pwd = (body.password || '').trim();
     const name = (body.name || user).trim();
+    // 【审查修复 H1 纵深防御】账号名白名单（长度 ≤50，拒绝 < >）
+    const nameError = validateAccountName(name);
+    if (nameError) { jsonResponse(res, { error: nameError }, 400); return; }
     const accountType = body.accountType || 'main';
     // 【2026-09-22】移动云账号创建时不显式写入 autoBoot（自动开机守护）：
     // 由账号级 + 单机双开关独立判定，省略即按默认口径（见 ydpc_client.js 的 _autoBootArmed）。
@@ -4577,6 +4766,9 @@ function rewardNeedsDesktop(prodId, prodType) {
     const user = (body.user || '').trim();
     const pwd = (body.password || '').trim();
     const name = (body.name || user).trim();
+    // 【审查修复 H1 纵深防御】账号名白名单（长度 ≤50，拒绝 < >）
+    const nameError = validateAccountName(name);
+    if (nameError) { jsonResponse(res, { error: nameError }, 400); return; }
     const keepaliveInterval = Math.max(60, parseInt(body.keepaliveInterval) || 300);
 
     if (!user || !pwd) { jsonResponse(res, { error: '移动公众账号与密码不能为空' }, 400); return; }
@@ -4767,6 +4959,9 @@ function rewardNeedsDesktop(prodId, prodType) {
     const user = (body.user || '').trim();
     const pwd = (body.password || '').trim();
     const name = (body.name || user).trim();
+    // 【审查修复 H1 纵深防御】账号名白名单（长度 ≤50，拒绝 < >）
+    const nameError = validateAccountName(name);
+    if (nameError) { jsonResponse(res, { error: nameError }, 400); return; }
     const devCode = (body.deviceCode || '').trim() || generateDeviceCode();
 
     const captchaCode = (body.captchaCode || '').trim();
@@ -4982,7 +5177,12 @@ function rewardNeedsDesktop(prodId, prodType) {
     }
 
     const body = await parseJsonBody(req);
-    if (body.name) acc.name = body.name;
+    // 【审查修复 H1 纵深防御】改名同样走账号名白名单
+    if (body.name) {
+      const nameError = validateAccountName(body.name);
+      if (nameError) { jsonResponse(res, { error: nameError }, 400); return; }
+      acc.name = body.name.trim();
+    }
     if (body.user) acc.user = body.user;
     // 2026-10-16 安全修复：编辑表单预填的是接口返回的哨兵掩码，原样回传时
     // 视为"用户未修改密码"，保留内存中的真实密码，绝不能把掩码写回存储。
@@ -5126,7 +5326,8 @@ function rewardNeedsDesktop(prodId, prodType) {
 
     try {
       // 1. 获取 Challenge Code
-      const chalRes = await fetch('https://desk.ctyun.cn:8810/api/auth/client/genChallengeData', {
+      // 【审查修复 M5】裸 fetch 改 fetchWithTimeout（默认 15 秒），防上游挂起。
+      const chalRes = await fetchWithTimeout('https://desk.ctyun.cn:8810/api/auth/client/genChallengeData', {
         method: 'POST',
         headers: {
           'ctg-devicetype': '60',
@@ -5143,7 +5344,8 @@ function rewardNeedsDesktop(prodId, prodType) {
 
       // 2. 拉取官方图形验证码图片流并转为 Base64
       const capUrl = `https://desk.ctyun.cn:8810/api/auth/client/captcha?height=36&width=85&userInfo=${encodeURIComponent(phone)}&mode=auto&_t=${Date.now()}`;
-      const capRes = await fetch(capUrl, {
+      // 【审查修复 M5】裸 fetch 改 fetchWithTimeout（默认 15 秒），防上游挂起。
+      const capRes = await fetchWithTimeout(capUrl, {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/137.0.0.0',
           'ctg-devicetype': '60',
@@ -5203,6 +5405,9 @@ function rewardNeedsDesktop(prodId, prodType) {
     const qrCodeId = parsedUrl.searchParams.get('qrCodeId');
     const deviceCode = parsedUrl.searchParams.get('deviceCode') || generateDeviceCode();
     const accountName = (parsedUrl.searchParams.get('accountName') || '').trim();
+    // 【审查修复 H1 纵深防御】扫码自定义账号名同样走白名单
+    const accountNameError = validateAccountName(accountName);
+    if (accountNameError) { jsonResponse(res, { error: accountNameError }, 400); return; }
     const targetAccId = parsedUrl.searchParams.get('accId');
 
     if (!qrCodeId) {
@@ -5369,7 +5574,8 @@ function rewardNeedsDesktop(prodId, prodType) {
     try {
       const timestamp = Date.now();
       const capUrl = `https://desk.ctyun.cn:8810/api/auth/client/validateCode/captcha?width=120&height=40&_t=${timestamp}`;
-      const capRes = await fetch(capUrl, { headers: client.getSignedHeaders() });
+      // 【审查修复 M5】裸 fetch 改 fetchWithTimeout（默认 15 秒），防上游挂起。
+      const capRes = await fetchWithTimeout(capUrl, { headers: client.getSignedHeaders() });
       if (!capRes.ok) throw new Error(`获取短信图验失败: HTTP ${capRes.status}`);
       const captchaKey = capRes.headers.get('ctg-captcha-key') || capRes.headers.get('CTG-CAPTCHA-KEY') || '';
       const imgBuf = Buffer.from(await capRes.arrayBuffer());
@@ -5416,7 +5622,8 @@ function rewardNeedsDesktop(prodId, prodType) {
       if (captchaCodeKey) {
         url += `&captchaCodeKey=${encodeURIComponent(captchaCodeKey)}`;
       }
-      const resSms = await fetch(url, { headers: client.getSignedHeaders() });
+      // 【审查修复 M5】裸 fetch 改 fetchWithTimeout（默认 15 秒），防上游挂起。
+      const resSms = await fetchWithTimeout(url, { headers: client.getSignedHeaders() });
       const dataSms = await resSms.json();
       const smsKey = resSms.headers.get('ctg-sms-key') || resSms.headers.get('CTG-SMS-KEY') || '';
       const smsCode = normalizeBusinessCode(dataSms.code);
@@ -5479,7 +5686,8 @@ function rewardNeedsDesktop(prodId, prodType) {
       if (smsCodeKey) {
         form.append('smsCodeKey', smsCodeKey);
       }
-      const bindRes = await fetch('https://desk.ctyun.cn:8810/api/cdserv/client/device/binding', {
+      // 【审查修复 M5】裸 fetch 改 fetchWithTimeout（默认 15 秒），防上游挂起。
+      const bindRes = await fetchWithTimeout('https://desk.ctyun.cn:8810/api/cdserv/client/device/binding', {
         method: 'POST',
         headers: { ...client.getSignedHeaders(), 'Content-Type': 'application/x-www-form-urlencoded' },
         body: form.toString()
@@ -5909,11 +6117,13 @@ function rewardNeedsDesktop(prodId, prodType) {
             await new Promise(r => setTimeout(r, 3000));
           }
 
-          const orderRes = await fetch(placeOrderUrl, {
+          // 【审查修复 M5】手动兑换下单同样加 30 秒超时（与自动兑换 M4 同口径）：
+          // 超时抛错走下方 catch，按"结果不明确"处理，绝不盲目重试。
+          const orderRes = await fetchWithTimeout(placeOrderUrl, {
             method: 'POST',
             headers: client.getSignedHeaders({ 'Content-Type': 'application/json;charset=UTF-8' }),
             body: JSON.stringify(orderPayload)
-          });
+          }, 30000);
           const orderData = await orderRes.json();
 
           // 深查第 16 轮：与自动兑换 S11（app/tasks/redeem_order.js）同口径——
@@ -6521,7 +6731,8 @@ function rewardNeedsDesktop(prodId, prodType) {
       // 如果是 merge，检查手机号/账号名是否已存在同平台账号
       const existing = appConfig.accounts.find(a => a.user === item.user && a.ownerId === targetOwnerId && (a.platform || 'ctyun') === platformStr);
       if (existing) {
-        existing.name = item.name || existing.name;
+        // 【审查修复 H1】导入不因单个坏名字失败：去掉 < > 并截断到 50 字符
+        existing.name = sanitizeImportedAccountName(item.name, existing.name);
         if (item.password) existing.password = item.password;
         if (isYdpc && item.accountType) existing.accountType = item.accountType;
         if (isYdpc && item.keepaliveInterval) existing.keepaliveInterval = item.keepaliveInterval;
@@ -6543,7 +6754,7 @@ function rewardNeedsDesktop(prodId, prodType) {
         platform: platformStr,
         ownerId: targetOwnerId,
         accountType: isYdpc ? (item.accountType || 'main') : undefined,
-        name: item.name || item.user,
+        name: sanitizeImportedAccountName(item.name, item.user),
         user: item.user,
         password: item.password || '',
         deviceCode: item.deviceCode || generateDeviceCode(),
@@ -6702,5 +6913,10 @@ module.exports = {
   TASK_CN_NAME,
   ECLOUD_KEEPALIVE_TASKS,
   buildEcloudDefaultFeatures,
-  inferLogPlatform
+  inferLogPlatform,
+  // 【审查修复 H1/L2/L3】导出 XSS 防护辅助函数，供回归测试直接断言行为
+  escapeHtml,
+  safeJsonForScript,
+  validateAccountName,
+  sanitizeImportedAccountName
 };

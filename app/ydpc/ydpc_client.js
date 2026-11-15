@@ -137,7 +137,21 @@ class YdpcClient {
     }
   }
 
+  // 【审查修复 L9】in-flight 守卫：7 处 fire-and-forget 的 setTimeout 刷新、
+  // 调度器与主循环可并发触发 refreshVms，旧实现每次都重复探测并竞写
+  // account.vms/metrics。现并发调用共享同一次刷新。
   async refreshVms() {
+    if (this._refreshVmsPromise) return this._refreshVmsPromise;
+    const p = this._refreshVmsImpl();
+    this._refreshVmsPromise = p;
+    try {
+      return await p;
+    } finally {
+      if (this._refreshVmsPromise === p) this._refreshVmsPromise = null;
+    }
+  }
+
+  async _refreshVmsImpl() {
     const accName = this.account.name || this.account.user;
     try {
       if (!this.sohoClient.sohoToken) {

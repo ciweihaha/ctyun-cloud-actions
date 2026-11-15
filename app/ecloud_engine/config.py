@@ -21,9 +21,15 @@
        }
        部署对照：Docker 镜像内 ECLOUD_CRED_FILE=/app/data/ecloud_credentials.json
        （即宿主机 compose 目录下的 data/ecloud_credentials.json）。
-  3) 内置公开常量（兜底，保证开箱即用）
+  3) 内置公开常量（兜底）
        <本目录>/public_credentials.json —— 官方公众线客户端内置的固定材料，
-       属公开信息，随仓库与镜像分发。平台轮换该套 Key 时替换此文件即可。
+       属公开信息。平台轮换该套 Key 时替换此文件即可。
+
+       【审查修复 L11】注意：该文件被 .gitignore 排除，**并不随仓库分发**，
+       仓库检出后默认不存在；旧文档称其"随仓库与镜像分发、保证开箱即用"
+       与实际不符。未配环境变量/覆盖文件且本地无此文件时，侧车启动即抛
+       CredentialMissing —— 属预期行为，请按上面第 1/2 级提供凭据，
+       或在部署机本地放置该文件（切勿提交入库）。
 
 这四个值是"官方公众线客户端"的固定签名材料（HmacSHA1 签名 + 整体 RSA-1024 的
 组成部分，技术上无法像 token 那样动态获取），**不含任何账号信息**；账号凭据
@@ -74,7 +80,7 @@ def _load_credentials() -> tuple[str, str, str, str]:
 
     # 环境变量未给全 → 依次回落到「覆盖文件」与「内置公开常量」
     #   · 覆盖文件：ECLOUD_CRED_FILE 指定，或默认 <本目录>/credentials.json（可不存在）
-    #   · 内置文件：<本目录>/public_credentials.json（随仓库与镜像分发，保证开箱即用）
+    #   · 内置文件：<本目录>/public_credentials.json（本地放置才存在，不随仓库分发，见模块文档 L11）
     cred_file = os.environ.get("ECLOUD_CRED_FILE") or str(
         Path(__file__).resolve().with_name("credentials.json")
     )

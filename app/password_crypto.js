@@ -9,10 +9,17 @@
  */
 const crypto = require('crypto');
 
+// 【审查修复 L14】密文格式严格判定：旧实现 encryptPassword 遇 `ENC:` 前缀直接
+// 返回原文，真实密码恰以 `ENC:` 开头时保存后即无法解密（decrypt 按密文解析
+// 失败返回 ''）。现只有符合真实密文格式（ENC: + 24 位 hex IV + 32 位 hex
+// tag + hex 密文）的值才视为已加密、跳过重复加密；其余 `ENC:` 开头明文正常加密。
+// decrypt 保持原口径：`ENC:` 开头但解析失败仍返回 ''（见回归测试）。
+const CIPHER_TEXT_RE = /^ENC:[0-9a-f]{24}:[0-9a-f]{32}:[0-9a-f]+$/;
+
 function createPasswordCrypto(masterKey, { onError = () => {} } = {}) {
   function encryptPassword(plainText) {
     if (!plainText || typeof plainText !== 'string') return '';
-    if (plainText.startsWith('ENC:')) return plainText; // 避免重复加密
+    if (CIPHER_TEXT_RE.test(plainText)) return plainText; // 已是密文，避免重复加密
     const iv = crypto.randomBytes(12);
     const cipher = crypto.createCipheriv('aes-256-gcm', masterKey, iv);
     let enc = cipher.update(plainText, 'utf8', 'hex');

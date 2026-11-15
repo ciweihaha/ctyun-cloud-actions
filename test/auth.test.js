@@ -71,6 +71,28 @@ test('changeOwnPassword: 必须验证当前密码（旧路由完全不验）', (
   assert.equal(am.verifySession(other), null);
 });
 
+// 【审查修复 L7】登录接口不得枚举用户名：不存在的用户与密码错误返回同一文案。
+test('login: 用户不存在与密码错误返回同一文案（防枚举）', () => {
+  const am = makeAuth();
+  am.register('alice', 'long-enough-1');
+  const missing = am.login('nobody-here', 'whatever-pass');
+  const wrongPw = am.login('alice', 'wrong-password');
+  assert.equal(missing.success, false);
+  assert.equal(wrongPw.success, false);
+  assert.equal(missing.error, wrongPw.error);
+  assert.equal(missing.error, '用户名或密码错误');
+  assert.equal(am.login('alice', 'long-enough-1').success, true);
+});
+
+// 【审查修复 L8】注册用户名缺失时返回错误而非抛 500（旧实现 username.trim() 抛 TypeError）。
+test('register: 用户名/密码缺失或非字符串时返回错误，不抛错', () => {
+  const am = makeAuth();
+  assert.equal(am.register(undefined, 'long-enough-1').success, false);
+  assert.equal(am.register('bob', undefined).success, false);
+  assert.equal(am.register(null, null).success, false);
+  assert.equal(am.register(123, 'long-enough-1').success, false);
+});
+
 test('LoginRateLimiter: 10 次失败后拦截、窗口过期恢复、成功清零', () => {
   let now = 1_000_000;
   const rl = new LoginRateLimiter({ nowFn: () => now });
