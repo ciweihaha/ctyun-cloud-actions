@@ -1,0 +1,23 @@
+name: dependabot auto-merge
+# CF-OPT 自动化战役: dependabot 补丁/小版本 PR 在 CI 通过后自动 squash 合并
+# 需要仓库 Settings -> General -> Pull Requests 开启 "Allow auto-merge"
+# 大版本(major)升级保持人工把关
+on:
+  pull_request:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  automerge:
+    runs-on: ubuntu-latest
+    if: github.actor == 'dependabot[bot]'
+    steps:
+      - uses: dependabot/fetch-metadata@v2
+        id: metadata
+      - name: auto-merge patch and minor bumps
+        if: steps.metadata.outputs.update-type == 'version-update:semver-patch' || steps.metadata.outputs.update-type == 'version-update:semver-minor'
+        run: gh pr merge --auto --squash "${{ github.event.pull_request.html_url }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
